@@ -62,6 +62,145 @@ class VReg:
         return False
 
 
+def get_defs_uses(engine, args):
+    """Extract VReg defs (writes) and uses (reads) from a slot.
+
+    Returns (defs: set[VReg], uses: set[VReg]).
+    Tracks ALL VRegs including pinned ones for dependency analysis.
+    """
+    if engine in ("debug", "flow", "barrier"):
+        return set(), set()
+
+    if engine == "store":
+        # Stores write to main memory, not scratch. All VReg args are uses.
+        uses = {a for a in args[1:] if isinstance(a, VReg)}
+        return set(), uses
+
+    # For alu, valu, load: args[1] is dest (def), args[2:] are sources (uses)
+    defs = set()
+    uses = set()
+    if len(args) > 1 and isinstance(args[1], VReg):
+        defs.add(args[1])
+    for a in args[2:]:
+        if isinstance(a, VReg):
+            uses.add(a)
+    return defs, uses
+
+
+def schedule_segment(slots, slot_limits):
+    """Schedule a segment of ops (no barriers) using list scheduling.
+
+    Builds a DAG from VReg def-use chains and greedily packs independent
+    ops into cycles respecting slot limits.
+
+    Args:
+        slots: List of (engine, args) tuples with VRegs
+        slot_limits: Dict of {engine: max_per_cycle}
+
+    Returns:
+        List of bundles (list of list of slots)
+    """
+    n = len(slots)
+    if n == 0:
+        return []
+
+    # Step 1: Compute defs/uses per slot
+    slot_defs = []
+    slot_uses = []
+    for engine, args in slots:
+        d, u = get_defs_uses(engine, args)
+        slot_defs.append(d)
+        slot_uses.append(u)
+
+    # Step 2: Build DAG
+    # Track which slots define each VReg (handles load_offset partial defs)
+    vreg_definers = defaultdict(list)  # vreg -> [slot indices that define it]
+    successors = [[] for _ in range(n)]
+    in_degree = [0] * n
+
+    for i in range(n):
+        # Add edges: i depends on all definers of VRegs it uses
+        preds_for_i = set()
+        for vreg in slot_uses[i]:
+            for definer in vreg_definers[vreg]:
+                if definer not in preds_for_i:
+                    preds_for_i.add(definer)
+                    successors[definer].append(i)
+                    in_degree[i] += 1
+
+        # Register this slot's defs
+        for vreg in slot_defs[i]:
+            vreg_definers[vreg].append(i)
+
+    # Step 3: List scheduling
+    ready = sorted([i for i in range(n) if in_degree[i] == 0])
+    bundles = []
+
+    while ready:
+        bundle = []
+        available = dict(slot_limits)
+        scheduled_this_cycle = []
+        remaining = []
+
+        for i in ready:
+            engine = slots[i][0]
+            if available.get(engine, 0) > 0:
+                bundle.append(slots[i])
+                available[engine] -= 1
+                scheduled_this_cycle.append(i)
+            else:
+                remaining.append(i)
+
+        # Newly ready ops (for next cycle)
+        newly_ready = []
+        for i in scheduled_this_cycle:
+            for succ in successors[i]:
+                in_degree[succ] -= 1
+                if in_degree[succ] == 0:
+                    newly_ready.append(succ)
+
+        # Next cycle's ready list: unscheduled from this cycle + newly unblocked
+        ready = remaining + sorted(newly_ready)
+        if bundle:
+            bundles.append(bundle)
+
+    return bundles
+
+
+def schedule(slots, slot_limits=None):
+    """Schedule ops into bundles with configurable slot limits.
+
+    Splits on barrier pseudo-ops, schedules each segment independently.
+
+    Args:
+        slots: List of (engine, args) tuples, may include ("barrier", ())
+        slot_limits: Optional dict overriding SLOT_LIMITS. Keys are engine
+                     names, values are max ops per cycle for that engine.
+
+    Returns:
+        List of bundles (list of list of slots)
+    """
+    if slot_limits is None:
+        slot_limits = dict(SLOT_LIMITS)
+
+    # Split on barriers
+    segments = []
+    current = []
+    for slot in slots:
+        if slot[0] == "barrier":
+            segments.append(current)
+            current = []
+        else:
+            current.append(slot)
+    segments.append(current)
+
+    # Schedule each segment independently
+    bundles = []
+    for segment in segments:
+        bundles.extend(schedule_segment(segment, slot_limits))
+    return bundles
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -70,6 +209,8 @@ class KernelBuilder:
         self.scratch_ptr = 0
         self.const_map = {}
         self.vregs = {}  # name -> VReg for named vregs
+        self.pending_const_loads = []  # ("const", addr, val) tuples to batch-emit
+        self.pending_mem_loads = []    # ("load", dest, src) tuples to batch-emit
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
@@ -200,8 +341,8 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
             self.const_map[val] = addr
+            self.pending_const_loads.append(("const", addr, val))
         return self.const_map[val]
 
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
@@ -251,12 +392,9 @@ class KernelBuilder:
     def setup_kernel_scratch_and_constants(self):
         """
         Allocate scratch space and set up initial constants.
-        Returns tuple of (tmp1, tmp2, tmp3, zero_const, one_const, two_const).
+        Collects loads into pending lists for batch emission.
+        Returns (one_const, two_const).
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-
         # Scratch space addresses for kernel parameters
         init_vars = [
             "rounds",
@@ -269,40 +407,48 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
+        # Use a separate temp per param so all pairs are independent
+        for i, v in enumerate(init_vars):
+            tmp = self.alloc_scratch(f"param_idx_{i}")
+            self.pending_const_loads.append(("const", tmp, i))
+            self.pending_mem_loads.append(("load", self.scratch[v], tmp))
+
+        # Pre-load basic constants and hash constants
+        self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-
-        # Pre-load all hash function constants to avoid loading them in the hot loop
-        for op1, val1, op2, op3, val3 in HASH_STAGES:
+        for _, val1, _, _, val3 in HASH_STAGES:
             self.scratch_const(val1)
             self.scratch_const(val3)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
+        return one_const, two_const
 
-        return tmp1, tmp2, tmp3, zero_const, one_const, two_const
+    def emit_pending_loads(self):
+        """Batch-emit all pending const and mem loads, packed 2 per cycle."""
+        # Const loads first (all independent)
+        for i in range(0, len(self.pending_const_loads), 2):
+            chunk = self.pending_const_loads[i:i+2]
+            self.instrs.append({"load": chunk})
+
+        # Mem loads second (each depends on its const, but independent of each other)
+        for i in range(0, len(self.pending_mem_loads), 2):
+            chunk = self.pending_mem_loads[i:i+2]
+            self.instrs.append({"load": chunk})
+
+        self.pending_const_loads.clear()
+        self.pending_mem_loads.clear()
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        slot_limits=None,
     ):
         """
         Vectorized kernel using virtual registers.
         Each write creates a fresh vreg (SSA form).
         """
-        # Setup phase uses physical addresses for parameters loaded from memory
-        tmp1, tmp2, tmp3, zero_const, one_const, two_const = (
-            self.setup_kernel_scratch_and_constants()
-        )
+        # Setup phase: allocate scratch and register constants
+        one_const, two_const = self.setup_kernel_scratch_and_constants()
 
         body = []  # array of (engine, args) slots with virtual registers
 
@@ -319,7 +465,7 @@ class KernelBuilder:
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        for hi, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
             const1_vec = self.pinned_vreg(f"hash_c1_{hi}_vec", VLEN)
             const3_vec = self.pinned_vreg(f"hash_c3_{hi}_vec", VLEN)
             body.append(("valu", ("vbroadcast", const1_vec, self.scratch_const(val1))))
@@ -329,30 +475,44 @@ class KernelBuilder:
 
         n_vectors = batch_size // VLEN
 
+        # Pre-register offset constants so they're in the batch
+        for vi in range(n_vectors):
+            self.scratch_const(vi * VLEN)
+
+        # Now emit all pending loads packed 2-per-cycle, then pause
+        self.emit_pending_loads()
+        self.add("flow", ("pause",))
+
+        # Load indices and values from memory into scratch (once)
+        idx_vecs = []  # current index vector per vi chunk
+        val_vecs = []  # current value vector per vi chunk
+        for vi in range(n_vectors):
+            offset_const = self.scratch_const(vi * VLEN)
+            idx_base = self.new_vreg(f"idx_base_init_v{vi}")
+            val_base = self.new_vreg(f"val_base_init_v{vi}")
+            body.append(("alu", ("+", idx_base, self.scratch["inp_indices_p"], offset_const)))
+            body.append(("alu", ("+", val_base, self.scratch["inp_values_p"], offset_const)))
+
+            idx_v = self.new_vreg_vec(f"idx_init_v{vi}")
+            val_v = self.new_vreg_vec(f"val_init_v{vi}")
+            body.append(("load", ("vload", idx_v, idx_base)))
+            body.append(("load", ("vload", val_v, val_base)))
+            idx_vecs.append(idx_v)
+            val_vecs.append(val_v)
+
+        # Main loop: all rounds, reading/writing scratch VRegs (no memory round-trip)
         for rnd in range(rounds):
+            new_idx_vecs = []
+            new_val_vecs = []
             for vi in range(n_vectors):
-                offset = vi * VLEN
-                offset_const = self.scratch_const(offset)
-
-                # Fresh vregs for this iteration's computations
-                idx_base = self.new_vreg(f"idx_base_r{rnd}_v{vi}")
-                val_base = self.new_vreg(f"val_base_r{rnd}_v{vi}")
-
-                # Compute base addresses
-                body.append(("alu", ("+", idx_base, self.scratch["inp_indices_p"], offset_const)))
-                body.append(("alu", ("+", val_base, self.scratch["inp_values_p"], offset_const)))
-
-                # Load indices and values into fresh vregs
-                idx_loaded = self.new_vreg_vec(f"idx_r{rnd}_v{vi}")
-                val_loaded = self.new_vreg_vec(f"val_r{rnd}_v{vi}")
-                body.append(("load", ("vload", idx_loaded, idx_base)))
-                body.append(("load", ("vload", val_loaded, val_base)))
+                idx_loaded = idx_vecs[vi]
+                val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
                 addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
                 body.append(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)))
 
-                # Gather node values from tree
+                # Gather node values from tree (still from main memory)
                 gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
                 body.extend(gather_slots)
 
@@ -379,13 +539,24 @@ class KernelBuilder:
                 body.append(("valu", ("<", in_bounds, idx_next, n_nodes_vec)))
                 body.append(("valu", ("*", idx_wrapped, idx_next, in_bounds)))
 
-                # Store results
-                body.append(("store", ("vstore", idx_base, idx_wrapped)))
-                body.append(("store", ("vstore", val_base, val_hashed)))
+                new_idx_vecs.append(idx_wrapped)
+                new_val_vecs.append(val_hashed)
 
-        # Convert flat slot list to bundles (one slot per bundle for now)
-        # A scheduler would pack multiple slots into fewer bundles
-        bundles = [[slot] for slot in body]
+            idx_vecs = new_idx_vecs
+            val_vecs = new_val_vecs
+
+        # Store final results back to memory (once)
+        for vi in range(n_vectors):
+            offset_const = self.scratch_const(vi * VLEN)
+            idx_base = self.new_vreg(f"idx_base_final_v{vi}")
+            val_base = self.new_vreg(f"val_base_final_v{vi}")
+            body.append(("alu", ("+", idx_base, self.scratch["inp_indices_p"], offset_const)))
+            body.append(("alu", ("+", val_base, self.scratch["inp_values_p"], offset_const)))
+            body.append(("store", ("vstore", idx_base, idx_vecs[vi])))
+            body.append(("store", ("vstore", val_base, val_vecs[vi])))
+
+        # Schedule: pack independent ops into same cycle
+        bundles = schedule(body, slot_limits)
 
         # Allocate physical addresses for virtual registers
         physical_bundles = self.allocate_vregs(bundles)
@@ -404,6 +575,7 @@ def do_kernel_test(
     seed: int = 123,
     trace: bool = False,
     prints: bool = False,
+    slot_limits=None,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -412,7 +584,8 @@ def do_kernel_test(
     mem = build_mem_image(forest, inp)
 
     kb = KernelBuilder()
-    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
+    kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
+                     slot_limits=slot_limits)
     # print(kb.instrs)
 
     value_trace = {}
