@@ -37,6 +37,31 @@ from problem import (
 )
 
 
+class VReg:
+    """A virtual register representing a value, not a physical location."""
+    _counter = 0
+
+    def __init__(self, name_hint="", size=1, pinned_addr=None):
+        self.id = VReg._counter
+        VReg._counter += 1
+        self.name_hint = name_hint
+        self.size = size  # 1 for scalar, VLEN for vector
+        self.pinned_addr = pinned_addr  # If set, must use this physical address
+
+    def __repr__(self):
+        if self.name_hint:
+            return f"v{self.id}_{self.name_hint}"
+        return f"v{self.id}"
+
+    def __hash__(self):
+        return hash(self.id)
+
+    def __eq__(self, other):
+        if isinstance(other, VReg):
+            return self.id == other.id
+        return False
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -44,15 +69,120 @@ class KernelBuilder:
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.vregs = {}  # name -> VReg for named vregs
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def new_vreg(self, name_hint="", size=1):
+        """Create a new unique virtual register."""
+        return VReg(name_hint=name_hint, size=size)
+
+    def new_vreg_vec(self, name_hint=""):
+        """Create a new unique vector virtual register."""
+        return VReg(name_hint=name_hint, size=VLEN)
+
+    def pinned_vreg(self, name, size=1):
+        """Create or get a pinned virtual register (allocated to fixed physical address)."""
+        if name not in self.vregs:
+            addr = self.alloc_scratch(name, size)
+            vreg = VReg(name_hint=name, size=size, pinned_addr=addr)
+            self.vregs[name] = vreg
+        return self.vregs[name]
+
+    def pinned_const(self, val, name=None):
+        """Get a pinned vreg for a constant value."""
+        if val not in self.const_map:
+            vreg_name = name or f"const_{val}"
+            addr = self.alloc_scratch(vreg_name)
+            self.add("load", ("const", addr, val))
+            vreg = VReg(name_hint=vreg_name, size=1, pinned_addr=addr)
+            self.const_map[val] = vreg
+        return self.const_map[val]
+
+    def allocate_vregs(self, bundles):
+        """
+        Allocate physical scratch addresses for virtual registers.
+        Uses liveness analysis to reuse scratch space.
+
+        Args:
+            bundles: List of bundles, where each bundle is a list of slots.
+                     Each bundle represents one cycle.
+
+        Returns:
+            List of bundles with physical addresses instead of VRegs.
+        """
+        # Step 1: Compute liveness - find last cycle where each vreg is used
+        last_use = {}  # vreg -> cycle index of last use
+
+        def collect_vregs(args):
+            """Collect all VRegs from instruction arguments."""
+            for a in args:
+                if isinstance(a, VReg) and a.pinned_addr is None:
+                    yield a
+
+        for cycle_idx, bundle in enumerate(bundles):
+            for (engine, args) in bundle:
+                if engine == "debug":
+                    continue
+                for vreg in collect_vregs(args):
+                    last_use[vreg] = cycle_idx
+
+        # Step 2: Allocate with reuse based on cycle-level liveness
+        vreg_to_addr = {}
+        free_pool = defaultdict(list)  # size -> list of free addresses
+
+        def get_addr(vreg):
+            if isinstance(vreg, VReg):
+                if vreg.pinned_addr is not None:
+                    return vreg.pinned_addr
+                if vreg not in vreg_to_addr:
+                    if free_pool[vreg.size]:
+                        addr = free_pool[vreg.size].pop()
+                    else:
+                        addr = self.alloc_scratch(f"pool_{vreg.size}_{len(vreg_to_addr)}", vreg.size)
+                    vreg_to_addr[vreg] = addr
+                return vreg_to_addr[vreg]
+            return vreg
+
+        def free_dead_vregs(cycle_idx):
+            """Return addresses of vregs whose last use was this cycle."""
+            dead = [v for v, last in last_use.items() if last == cycle_idx and v in vreg_to_addr]
+            for vreg in dead:
+                addr = vreg_to_addr[vreg]
+                free_pool[vreg.size].append(addr)
+
+        def rewrite_slot(slot):
+            engine, args = slot
+            if engine == "debug":
+                return slot
+            new_args = tuple(get_addr(a) if isinstance(a, (VReg, int)) else a for a in args)
+            return (engine, new_args)
+
+        physical_bundles = []
+        for cycle_idx, bundle in enumerate(bundles):
+            physical_bundle = [rewrite_slot(slot) for slot in bundle]
+            physical_bundles.append(physical_bundle)
+            free_dead_vregs(cycle_idx)
+
+        return physical_bundles
+
+    def build(self, bundles: list[list[tuple[Engine, tuple]]]):
+        """
+        Convert bundles of slots into instruction format.
+
+        Args:
+            bundles: List of bundles, where each bundle is a list of (engine, args) slots.
+
+        Returns:
+            List of instruction dicts: [{engine: [slot, ...], ...}, ...]
+        """
         instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
+        for bundle in bundles:
+            instr = defaultdict(list)
+            for engine, args in bundle:
+                instr[engine].append(args)
+            instrs.append(dict(instr))
         return instrs
 
     def add(self, engine, slot):
@@ -85,17 +215,49 @@ class KernelBuilder:
 
         return slots
 
-    def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
-    ):
+    def build_vhash(self, val_in, hash_const_vecs):
+        """Vectorized hash - operates on VLEN elements at once.
+        Uses virtual registers. Returns (slots, val_out) where val_out is the result vreg."""
+        slots = []
+        val_vec = val_in
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            const1_vec = hash_const_vecs[hi * 2]
+            const3_vec = hash_const_vecs[hi * 2 + 1]
+
+            # Create fresh vregs for this stage's outputs
+            tmp1 = self.new_vreg_vec(f"hash{hi}_t1")
+            tmp2 = self.new_vreg_vec(f"hash{hi}_t2")
+            val_out = self.new_vreg_vec(f"hash{hi}_out")
+
+            # tmp1 = op1(val, const1) and tmp2 = op3(val, const3) - independent
+            slots.append(("valu", (op1, tmp1, val_vec, const1_vec)))
+            slots.append(("valu", (op3, tmp2, val_vec, const3_vec)))
+            slots.append(("valu", (op2, val_out, tmp1, tmp2)))
+
+            val_vec = val_out  # Chain to next stage
+
+        return slots, val_vec
+
+    def build_gather(self, addr_vec, name_hint="gather"):
+        """Gather VLEN values from non-contiguous addresses into a vector.
+        Returns (slots, dest_vreg) where dest_vreg is the result."""
+        dest_vec = self.new_vreg_vec(name_hint)
+        slots = []
+        for i in range(VLEN):
+            slots.append(("load", ("load_offset", dest_vec, addr_vec, i)))
+        return slots, dest_vec
+
+    def setup_kernel_scratch_and_constants(self):
         """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Allocate scratch space and set up initial constants.
+        Returns tuple of (tmp1, tmp2, tmp3, zero_const, one_const, two_const).
         """
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
+        # Scratch space addresses for kernel parameters
         init_vars = [
             "rounds",
             "n_nodes",
@@ -115,6 +277,11 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
+        # Pre-load all hash function constants to avoid loading them in the hot loop
+        for op1, val1, op2, op3, val3 in HASH_STAGES:
+            self.scratch_const(val1)
+            self.scratch_const(val3)
+
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
@@ -123,52 +290,107 @@ class KernelBuilder:
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        return tmp1, tmp2, tmp3, zero_const, one_const, two_const
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+    def build_kernel(
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    ):
+        """
+        Vectorized kernel using virtual registers.
+        Each write creates a fresh vreg (SSA form).
+        """
+        # Setup phase uses physical addresses for parameters loaded from memory
+        tmp1, tmp2, tmp3, zero_const, one_const, two_const = (
+            self.setup_kernel_scratch_and_constants()
+        )
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        body = []  # array of (engine, args) slots with virtual registers
 
-        body_instrs = self.build(body)
+        # Pinned vregs for broadcast constants (allocated once, used throughout)
+        one_vec = self.pinned_vreg("one_vec", VLEN)
+        two_vec = self.pinned_vreg("two_vec", VLEN)
+        n_nodes_vec = self.pinned_vreg("n_nodes_vec", VLEN)
+        forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
+
+        body.append(("valu", ("vbroadcast", one_vec, one_const)))
+        body.append(("valu", ("vbroadcast", two_vec, two_const)))
+        body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
+        body.append(("valu", ("vbroadcast", forest_p_vec, self.scratch["forest_values_p"])))
+
+        # Pre-broadcast all 12 hash constants (pinned since used every iteration)
+        hash_const_vecs = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            const1_vec = self.pinned_vreg(f"hash_c1_{hi}_vec", VLEN)
+            const3_vec = self.pinned_vreg(f"hash_c3_{hi}_vec", VLEN)
+            body.append(("valu", ("vbroadcast", const1_vec, self.scratch_const(val1))))
+            body.append(("valu", ("vbroadcast", const3_vec, self.scratch_const(val3))))
+            hash_const_vecs.append(const1_vec)
+            hash_const_vecs.append(const3_vec)
+
+        n_vectors = batch_size // VLEN
+
+        for rnd in range(rounds):
+            for vi in range(n_vectors):
+                offset = vi * VLEN
+                offset_const = self.scratch_const(offset)
+
+                # Fresh vregs for this iteration's computations
+                idx_base = self.new_vreg(f"idx_base_r{rnd}_v{vi}")
+                val_base = self.new_vreg(f"val_base_r{rnd}_v{vi}")
+
+                # Compute base addresses
+                body.append(("alu", ("+", idx_base, self.scratch["inp_indices_p"], offset_const)))
+                body.append(("alu", ("+", val_base, self.scratch["inp_values_p"], offset_const)))
+
+                # Load indices and values into fresh vregs
+                idx_loaded = self.new_vreg_vec(f"idx_r{rnd}_v{vi}")
+                val_loaded = self.new_vreg_vec(f"val_r{rnd}_v{vi}")
+                body.append(("load", ("vload", idx_loaded, idx_base)))
+                body.append(("load", ("vload", val_loaded, val_base)))
+
+                # Compute gather addresses: addr = forest_p + idx
+                addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
+                body.append(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)))
+
+                # Gather node values from tree
+                gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
+                body.extend(gather_slots)
+
+                # val = val ^ node_val
+                val_xored = self.new_vreg_vec(f"xor_r{rnd}_v{vi}")
+                body.append(("valu", ("^", val_xored, val_loaded, node_val)))
+
+                # val = myhash(val)
+                hash_slots, val_hashed = self.build_vhash(val_xored, hash_const_vecs)
+                body.extend(hash_slots)
+
+                # idx = 2*idx + 1 + (val & 1)
+                parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
+                idx_doubled_plus1 = self.new_vreg_vec(f"idx2p1_r{rnd}_v{vi}")
+                idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
+
+                body.append(("valu", ("&", parity, val_hashed, one_vec)))
+                body.append(("valu", ("multiply_add", idx_doubled_plus1, idx_loaded, two_vec, one_vec)))
+                body.append(("valu", ("+", idx_next, idx_doubled_plus1, parity)))
+
+                # idx = idx * (idx < n_nodes) -- wraps to 0 if out of bounds
+                in_bounds = self.new_vreg_vec(f"inbounds_r{rnd}_v{vi}")
+                idx_wrapped = self.new_vreg_vec(f"idx_wrap_r{rnd}_v{vi}")
+                body.append(("valu", ("<", in_bounds, idx_next, n_nodes_vec)))
+                body.append(("valu", ("*", idx_wrapped, idx_next, in_bounds)))
+
+                # Store results
+                body.append(("store", ("vstore", idx_base, idx_wrapped)))
+                body.append(("store", ("vstore", val_base, val_hashed)))
+
+        # Convert flat slot list to bundles (one slot per bundle for now)
+        # A scheduler would pack multiple slots into fewer bundles
+        bundles = [[slot] for slot in body]
+
+        # Allocate physical addresses for virtual registers
+        physical_bundles = self.allocate_vregs(bundles)
+
+        body_instrs = self.build(physical_bundles)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
