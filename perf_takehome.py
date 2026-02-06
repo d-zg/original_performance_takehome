@@ -148,6 +148,13 @@ def schedule_segment(slots, slot_limits):
                 bundle.append(slots[i])
                 available[engine] -= 1
                 scheduled_this_cycle.append(i)
+            elif (engine == "valu"
+                  and slots[i][1][0] != "vbroadcast"
+                  and available.get("alu", 0) >= VLEN):
+                # Convert vector op to VLEN scalar ops
+                bundle.append(("valu_as_alu", slots[i][1]))
+                available["alu"] -= VLEN
+                scheduled_this_cycle.append(i)
             else:
                 remaining.append(i)
 
@@ -199,6 +206,28 @@ def schedule(slots, slot_limits=None):
     for segment in segments:
         bundles.extend(schedule_segment(segment, slot_limits))
     return bundles
+
+
+def expand_valu_as_alu(bundles):
+    """Expand valu_as_alu slots into VLEN scalar alu ops.
+
+    Must be called AFTER register allocation (physical addresses assigned).
+    """
+    result = []
+    for bundle in bundles:
+        new_bundle = []
+        for engine, args in bundle:
+            if engine == "valu_as_alu":
+                op = args[0]
+                dest = args[1]
+                sources = args[2:]
+                for i in range(VLEN):
+                    new_args = (op, dest + i) + tuple(s + i for s in sources)
+                    new_bundle.append(("alu", new_args))
+            else:
+                new_bundle.append((engine, args))
+        result.append(new_bundle)
+    return result
 
 
 class KernelBuilder:
@@ -560,6 +589,7 @@ class KernelBuilder:
 
         # Allocate physical addresses for virtual registers
         physical_bundles = self.allocate_vregs(bundles)
+        physical_bundles = expand_valu_as_alu(physical_bundles)
 
         body_instrs = self.build(physical_bundles)
         self.instrs.extend(body_instrs)
