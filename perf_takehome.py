@@ -47,6 +47,8 @@ class VReg:
         self.name_hint = name_hint
         self.size = size  # 1 for scalar, VLEN for vector
         self.pinned_addr = pinned_addr  # If set, must use this physical address
+        self.parent = None  # If set, this is a sub-element of a vector vreg
+        self.offset = 0     # Offset within parent
 
     def __repr__(self):
         if self.name_hint:
@@ -122,11 +124,16 @@ def schedule_segment(slots, slot_limits):
         # Add edges: i depends on all definers of VRegs it uses
         preds_for_i = set()
         for vreg in slot_uses[i]:
-            for definer in vreg_definers[vreg]:
-                if definer not in preds_for_i:
-                    preds_for_i.add(definer)
-                    successors[definer].append(i)
-                    in_degree[i] += 1
+            # Check both the vreg itself and its parent (for sub_vregs)
+            lookup_vregs = [vreg]
+            if hasattr(vreg, 'parent') and vreg.parent is not None:
+                lookup_vregs.append(vreg.parent)
+            for lv in lookup_vregs:
+                for definer in vreg_definers[lv]:
+                    if definer not in preds_for_i:
+                        preds_for_i.add(definer)
+                        successors[definer].append(i)
+                        in_degree[i] += 1
 
         # Register this slot's defs
         for vreg in slot_defs[i]:
@@ -149,7 +156,7 @@ def schedule_segment(slots, slot_limits):
                 available[engine] -= 1
                 scheduled_this_cycle.append(i)
             elif (engine == "valu"
-                  and slots[i][1][0] != "vbroadcast"
+                  and slots[i][1][0] not in ("vbroadcast", "multiply_add")
                   and available.get("alu", 0) >= VLEN):
                 # Convert vector op to VLEN scalar ops
                 bundle.append(("valu_as_alu", slots[i][1]))
@@ -252,6 +259,14 @@ class KernelBuilder:
         """Create a new unique vector virtual register."""
         return VReg(name_hint=name_hint, size=VLEN)
 
+    def sub_vreg(self, parent, offset):
+        """Create a scalar vreg aliased to parent vector vreg at given offset.
+        Resolves to parent's physical address + offset during allocation."""
+        child = VReg(name_hint=f"{parent.name_hint}[{offset}]", size=1)
+        child.parent = parent
+        child.offset = offset
+        return child
+
     def pinned_vreg(self, name, size=1):
         """Create or get a pinned virtual register (allocated to fixed physical address)."""
         if name not in self.vregs:
@@ -296,7 +311,11 @@ class KernelBuilder:
                 if engine == "debug":
                     continue
                 for vreg in collect_vregs(args):
-                    last_use[vreg] = cycle_idx
+                    # Sub-vregs extend their parent's liveness
+                    if vreg.parent is not None:
+                        last_use[vreg.parent] = max(last_use.get(vreg.parent, 0), cycle_idx)
+                    else:
+                        last_use[vreg] = cycle_idx
 
         # Step 2: Allocate with reuse based on cycle-level liveness
         vreg_to_addr = {}
@@ -306,6 +325,9 @@ class KernelBuilder:
             if isinstance(vreg, VReg):
                 if vreg.pinned_addr is not None:
                     return vreg.pinned_addr
+                # Sub-vregs resolve to parent's address + offset
+                if vreg.parent is not None:
+                    return get_addr(vreg.parent) + vreg.offset
                 if vreg not in vreg_to_addr:
                     if free_pool[vreg.size]:
                         addr = free_pool[vreg.size].pop()
@@ -409,6 +431,143 @@ class KernelBuilder:
 
         return slots, val_vec
 
+    def preload_level(self, k, forest_values_p_addr):
+        """Preload all node values at tree level k into broadcast vectors.
+
+        Args:
+            k: tree level (0 = root). Level k has 2^k nodes starting at
+               tree index (2^k - 1) in the implicit binary tree.
+            forest_values_p_addr: scalar scratch addr holding base pointer
+               to tree values in main memory.
+
+        Returns:
+            (slots, broadcast_vregs) where:
+            - slots: list of (engine, args) to append to body
+            - broadcast_vregs: list of 2^k vector vregs, each containing
+              one node value broadcast across VLEN elements
+
+        Steps:
+            1. Compute the memory base address for this level:
+               level_base = forest_values_p + (2^k - 1)
+               (2^k - 1 is a build-time constant, so use scratch_const)
+
+            2. vload the 2^k values into scratch. Each vload brings in 8
+               contiguous words, so you need ceil(2^k / 8) vloads. But here
+               2^k might be < 8 (levels 0-2), so for those you'll need
+               individual scalar loads instead.
+
+            3. vbroadcast each loaded scalar value into its own vector vreg.
+               These are the outputs the mux tree will consume.
+
+        Watch out for:
+            - Levels 0-2 have fewer than 8 nodes, so vload won't work cleanly.
+              Use individual "load" ops for those, or load 8 and ignore extras.
+            - Each vload needs a scalar vreg holding the memory address to
+              load from. You'll need to increment that address between vloads.
+        """
+        slots = []
+        n_nodes = 2 ** k
+
+        level_offset = self.scratch_const(2**k - 1)
+        level_base = self.new_vreg(f"level{k}_base")
+        slots.append(("alu", ("+", level_base, forest_values_p_addr, level_offset)))
+        vregs = []
+
+        for i in range(max(n_nodes//8, 1)):
+            current_offset = self.new_vreg(f"level{k}_offset_{i}")
+            offset_constant = self.scratch_const(i*VLEN)
+            slots.append(("alu", ("+", current_offset, level_base, offset_constant)))
+            vnode_vreg = self.new_vreg_vec(f"level{k}_offset_node_{i}")
+            slots.append(("load", ("vload", vnode_vreg, current_offset)))
+            vregs.append(vnode_vreg)
+
+        broadcast_vregs = []
+        for i, vreg in enumerate(vregs):
+            for j in range(8):
+                bcast = self.new_vreg_vec(f"level{k}_bcast{i*8 + j}")
+                broadcast_vregs.append(bcast)
+                slots.append(("valu", ("vbroadcast", bcast, self.sub_vreg(vreg, j))))
+
+        return slots, broadcast_vregs
+
+
+    def build_mux_select(self, broadcast_vregs, idx_vreg, k):
+        """Select each element's node value from preloaded level using a vselect mux tree.
+
+        Args:
+            broadcast_vregs: list of 2^k vector vregs from preload_level,
+                each containing one node value broadcast across VLEN.
+            idx_vreg: vector vreg holding current tree indices for this
+                vector group (each element is a tree node index).
+            k: tree level (broadcast_vregs has 2^k entries).
+
+        Returns:
+            (slots, result_vreg) where result_vreg is a vector vreg
+            containing the selected node value per element.
+
+        Steps:
+            1. Compute position within level:
+               position = idx - (2^k - 1)
+               This is a vector subtract using a broadcast constant.
+
+            2. Mux tree, k stages from MSB to LSB:
+               For stage s (0 to k-1):
+                 a. Extract bit (k-1-s) from position:
+                    bit = (position >> (k-1-s)) & 1
+                    This needs a shift and an AND, both valu ops.
+
+                 b. vselect pairs of candidates:
+                    For each pair (candidates[2j], candidates[2j+1]):
+                      result = vselect(bit, candidates[2j+1], candidates[2j])
+                    This halves the candidate list each stage.
+
+               Note: vselect(cond, a, b) returns a[i] if cond[i]!=0, else b[i].
+               So bit=1 picks candidates[2j+1] (right child path),
+               bit=0 picks candidates[2j] (left child path).
+
+            3. After k stages, one candidate remains — that's the result.
+
+        Watch out for:
+            - k=0 is a special case: only 1 broadcast vreg, no mux needed.
+              Just return it directly.
+            - Shift amounts are compile-time constants, so use scratch_const.
+        """
+        def shift_bit(idx_vreg, num_bits):
+            # returns (slots, bit_vreg) where bit_vreg has the extracted bit per element
+            s = []
+            shift_const_vec = self.pinned_vreg(f"shift_{num_bits}_vec", VLEN)
+            s.append(("valu", ("vbroadcast", shift_const_vec, self.scratch_const(num_bits))))
+            shifted = self.new_vreg_vec(f"shifted_{num_bits}")
+            s.append(("valu", (">>", shifted, idx_vreg, shift_const_vec)))
+            bit = self.new_vreg_vec(f"bit_{num_bits}")
+            s.append(("valu", ("&", bit, shifted, self.pinned_vreg("one_vec", VLEN))))
+            return s, bit
+
+        slots = []
+        remaining_vregs = broadcast_vregs
+        if k == 0:
+            return slots, broadcast_vregs[0]
+
+        adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx")
+        slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(f"level_start{k}_vec", VLEN))))
+
+        for stage in range(k): 
+            import pdb; 
+            pdb.set_trace()
+            shift_slots, condition_vreg = shift_bit(adjusted_idx, stage)
+            slots.extend(shift_slots)
+            next_vregs = []
+            for i in range(max(len(remaining_vregs)//2, 1)):
+                # grab i and i + 1, vselect between them  
+                next_vreg = remaining_vregs.pop(0)
+                adjacent_vreg = remaining_vregs.pop(0)
+                result_vreg = self.new_vreg_vec(f"mux_stage{stage}_{i}")
+                slots.append(("flow", ("vselect", result_vreg, condition_vreg, adjacent_vreg, next_vreg)))  
+                next_vregs.append(result_vreg)
+            remaining_vregs = next_vregs
+
+        return slots, remaining_vregs[0]
+
     def build_gather(self, addr_vec, name_hint="gather"):
         """Gather VLEN values from non-contiguous addresses into a vector.
         Returns (slots, dest_vreg) where dest_vreg is the result."""
@@ -491,6 +650,9 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", two_vec, two_const)))
         body.append(("valu", ("vbroadcast", n_nodes_vec, self.scratch["n_nodes"])))
         body.append(("valu", ("vbroadcast", forest_p_vec, self.scratch["forest_values_p"])))
+        for k in range(forest_height + 1): 
+            level_start_vec = self.pinned_vreg(f"level_start{k}_vec", VLEN)
+            body.append(("valu", ("vbroadcast", level_start_vec, self.scratch_const(2**k - 1))))
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
@@ -533,17 +695,26 @@ class KernelBuilder:
         for rnd in range(rounds):
             new_idx_vecs = []
             new_val_vecs = []
+            k = rnd % (forest_height + 1)
+            if k <= 1:
+                preload_slots, broadcast_vregs = self.preload_level(k, self.scratch["forest_values_p"])
+                body.extend(preload_slots)
+
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
-                body.append(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)))
+                if k <= 1:
+                    select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k)
+                    body.extend(select_slots)
+                else:
+                    addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
+                    body.append(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)))
 
-                # Gather node values from tree (still from main memory)
-                gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
-                body.extend(gather_slots)
+                    # Gather node values from tree (still from main memory)
+                    gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
+                    body.extend(gather_slots)
 
                 # val = val ^ node_val
                 val_xored = self.new_vreg_vec(f"xor_r{rnd}_v{vi}")
