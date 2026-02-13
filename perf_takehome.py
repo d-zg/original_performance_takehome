@@ -97,13 +97,14 @@ class ScratchAllocator:
     No watermarks — pressure equals actual occupied words.
     """
 
-    def __init__(self, scratch_start, scratch_size=SCRATCH_SIZE):
+    def __init__(self, scratch_start, scratch_size=SCRATCH_SIZE, scratch_debug=None):
         self.scratch_start = scratch_start
         self.scratch_size = scratch_size
         self.occupied = [False] * scratch_size
         for i in range(scratch_start):
             self.occupied[i] = True
         self.vreg_to_addr = {}
+        self.scratch_debug = scratch_debug  # addr -> (name, size) for trace display
         self.peak_usage = 0
         self.peak_cycle = -1
         self.peak_live_snapshot = []
@@ -122,6 +123,8 @@ class ScratchAllocator:
         addr = self._find_space(vreg.size)
         if addr is not None:
             self.vreg_to_addr[vreg] = addr
+            if self.scratch_debug is not None:
+                self.scratch_debug[addr] = (vreg.name_hint or f"v{vreg.id}", vreg.size)
         return addr
 
     def _find_space(self, size):
@@ -239,6 +242,7 @@ def schedule_segment(slots, slot_limits, allocator):
     # Step 2: Build DAG
     vreg_definers = defaultdict(list)
     successors = [[] for _ in range(n)]
+    predecessors = [[] for _ in range(n)]
     in_degree = [0] * n
 
     for i in range(n):
@@ -252,9 +256,20 @@ def schedule_segment(slots, slot_limits, allocator):
                     if definer not in preds_for_i:
                         preds_for_i.add(definer)
                         successors[definer].append(i)
+                        predecessors[i].append(definer)
                         in_degree[i] += 1
         for vreg in slot_defs[i]:
             vreg_definers[vreg].append(i)
+
+    def op_desc(i):
+        """Human-readable description of op i using vreg names."""
+        engine, args = slots[i]
+        op_name = args[0] if args else ""
+        # Get dest vreg name
+        dest = ""
+        if len(args) > 1 and isinstance(args[1], VReg):
+            dest = args[1].name_hint or f"v{args[1].id}"
+        return f"{engine} {op_name} {dest}".strip()
 
     # Step 2.5: Compute use counts for freeing
     use_count = defaultdict(int)
@@ -312,9 +327,20 @@ def schedule_segment(slots, slot_limits, allocator):
     partial_ops = {}
 
     ready_cycle = {}
+    op_scheduled_cycle = {}  # op index -> cycle it was scheduled
     cycle_num = 0
     for i in ready:
         ready_cycle[i] = 0
+
+    def build_dep_info(i):
+        """Build dependency info for op i: list of {desc, sched_cycle} for each predecessor."""
+        deps = []
+        for pred in predecessors[i]:
+            deps.append({
+                "op": op_desc(pred),
+                "cycle": op_scheduled_cycle.get(pred, -1),
+            })
+        return deps
 
     while ready or partial_ops:
         bundle = []
@@ -333,12 +359,13 @@ def schedule_segment(slots, slot_limits, allocator):
             can_do = min(alu_avail, VLEN - done_so_far)
             physical_args = allocator.rewrite_args(slots[i][1])
             bundle.append(("valu_as_alu", physical_args, done_so_far, can_do))
-            bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
+            bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i)})
             available["alu"] -= can_do
             partial_ops[i] = done_so_far + can_do
             if partial_ops[i] >= VLEN:
                 del partial_ops[i]
                 scheduled_this_cycle.append(i)
+                op_scheduled_cycle[i] = cycle_num
                 pending_frees.extend(consume_uses(i))
 
         # Sort ready ops: prefer those that free space
@@ -364,12 +391,14 @@ def schedule_segment(slots, slot_limits, allocator):
                 continue
 
             # Commit
+            meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i)}
             if can_native:
                 physical_args = allocator.rewrite_args(slots[i][1])
                 bundle.append((engine, physical_args))
-                bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
+                bundle_meta.append(meta)
                 available[engine] -= 1
                 scheduled_this_cycle.append(i)
+                op_scheduled_cycle[i] = cycle_num
                 pending_frees.extend(consume_uses(i))
             else:
                 # valu→alu promotion
@@ -377,13 +406,15 @@ def schedule_segment(slots, slot_limits, allocator):
                 can_do = min(alu_avail, VLEN)
                 physical_args = allocator.rewrite_args(slots[i][1])
                 bundle.append(("valu_as_alu", physical_args, 0, can_do))
-                bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
+                bundle_meta.append(meta)
                 available["alu"] -= can_do
                 if can_do >= VLEN:
                     scheduled_this_cycle.append(i)
+                    op_scheduled_cycle[i] = cycle_num
                     pending_frees.extend(consume_uses(i))
                 else:
                     partial_ops[i] = can_do
+                    op_scheduled_cycle[i] = cycle_num
                     # Don't consume uses yet — partial op still reading sources
 
         # End of cycle: free dead vregs
@@ -957,7 +988,7 @@ class KernelBuilder:
         body = setup_slots + body
 
         # Schedule + allocate in one pass
-        allocator = ScratchAllocator(self.scratch_ptr)
+        allocator = ScratchAllocator(self.scratch_ptr, scratch_debug=self.scratch_debug)
         bundles, sched_meta = schedule(body, slot_limits, allocator)
         allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)

@@ -352,7 +352,20 @@ class Machine:
             key = (core.pc - 1, name, i)
             info = self.debug_info.slot_sched_info.get(key)
             if info:
-                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {info["sched"] - info["ready"]}'
+                delay = info["sched"] - info["ready"]
+                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {delay}'
+                deps = info.get("deps", [])
+                if deps:
+                    # Format: "op1@cycle1, op2@cycle2" — show blocking dep (latest) first
+                    dep_strs = sorted(deps, key=lambda d: -d["cycle"])
+                    deps_fmt = "; ".join(f'{d["op"]}@{d["cycle"]}' for d in dep_strs)
+                    # Escape quotes for JSON
+                    deps_fmt = deps_fmt.replace('"', '\\"')
+                    sched_str += f', "deps": "{deps_fmt}"'
+                    if dep_strs:
+                        blocker = dep_strs[0]
+                        blocker_str = f'{blocker["op"]}@{blocker["cycle"]}'.replace('"', '\\"')
+                        sched_str += f', "blocked_by": "{blocker_str}"'
         self.trace.write(
             f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}"{sched_str} }} }},\n'
         )
