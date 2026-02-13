@@ -271,6 +271,17 @@ def schedule_segment(slots, slot_limits, allocator):
             dest = args[1].name_hint or f"v{args[1].id}"
         return f"{engine} {op_name} {dest}".strip()
 
+    def named_args(i):
+        """Capture vreg names from original slot args (before address rewrite)."""
+        engine, args = slots[i]
+        named = []
+        for a in args:
+            if isinstance(a, VReg):
+                named.append(a.name_hint or f"v{a.id}")
+            else:
+                named.append(a)
+        return f"({engine} {' '.join(str(x) for x in named)})"
+
     # Step 2.5: Compute use counts for freeing
     use_count = defaultdict(int)
     for i in range(n):
@@ -328,17 +339,26 @@ def schedule_segment(slots, slot_limits, allocator):
 
     ready_cycle = {}
     op_scheduled_cycle = {}  # op index -> cycle it was scheduled
+    op_to_id = {}  # op index -> unique op_id for flow events
+    next_op_id = [0]  # mutable counter
     cycle_num = 0
     for i in ready:
         ready_cycle[i] = 0
 
+    def assign_op_id(i):
+        if i not in op_to_id:
+            op_to_id[i] = next_op_id[0]
+            next_op_id[0] += 1
+        return op_to_id[i]
+
     def build_dep_info(i):
-        """Build dependency info for op i: list of {desc, sched_cycle} for each predecessor."""
+        """Build dependency info for op i: list of {desc, sched_cycle, op_id} for each predecessor."""
         deps = []
         for pred in predecessors[i]:
             deps.append({
                 "op": op_desc(pred),
                 "cycle": op_scheduled_cycle.get(pred, -1),
+                "op_id": assign_op_id(pred),
             })
         return deps
 
@@ -359,7 +379,7 @@ def schedule_segment(slots, slot_limits, allocator):
             can_do = min(alu_avail, VLEN - done_so_far)
             physical_args = allocator.rewrite_args(slots[i][1])
             bundle.append(("valu_as_alu", physical_args, done_so_far, can_do))
-            bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i)})
+            bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i)})
             available["alu"] -= can_do
             partial_ops[i] = done_so_far + can_do
             if partial_ops[i] >= VLEN:
@@ -391,7 +411,7 @@ def schedule_segment(slots, slot_limits, allocator):
                 continue
 
             # Commit
-            meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i)}
+            meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i)}
             if can_native:
                 physical_args = allocator.rewrite_args(slots[i][1])
                 bundle.append((engine, physical_args))
