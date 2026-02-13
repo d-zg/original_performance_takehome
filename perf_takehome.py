@@ -212,7 +212,7 @@ class ScratchAllocator:
                 print(f"      {prefix}: {count}")
 
 
-def schedule_segment(slots, slot_limits, allocator):
+def schedule_segment(slots, slot_limits, allocator, tags=None):
     """Schedule a segment of ops using list scheduling with integrated allocation.
 
     Builds a DAG from VReg def-use chains and greedily packs independent
@@ -223,6 +223,7 @@ def schedule_segment(slots, slot_limits, allocator):
         slots: List of (engine, args) tuples with VRegs
         slot_limits: Dict of {engine: max_per_cycle}
         allocator: ScratchAllocator instance for physical address management
+        tags: Optional list of dicts parallel to slots with metadata (vi, rnd, etc.)
 
     Returns:
         (bundles, sched_meta) where bundles have physical addresses
@@ -351,6 +352,13 @@ def schedule_segment(slots, slot_limits, allocator):
             next_op_id[0] += 1
         return op_to_id[i]
 
+    def build_meta(i):
+        """Build scheduling metadata dict for op i."""
+        meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i)}
+        if tags is not None and i < len(tags):
+            meta.update(tags[i])
+        return meta
+
     def build_dep_info(i):
         """Build dependency info for op i: list of {desc, sched_cycle, op_id} for each predecessor."""
         deps = []
@@ -379,7 +387,7 @@ def schedule_segment(slots, slot_limits, allocator):
             can_do = min(alu_avail, VLEN - done_so_far)
             physical_args = allocator.rewrite_args(slots[i][1])
             bundle.append(("valu_as_alu", physical_args, done_so_far, can_do))
-            bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i)})
+            bundle_meta.append(build_meta(i))
             available["alu"] -= can_do
             partial_ops[i] = done_so_far + can_do
             if partial_ops[i] >= VLEN:
@@ -411,7 +419,7 @@ def schedule_segment(slots, slot_limits, allocator):
                 continue
 
             # Commit
-            meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i)}
+            meta = build_meta(i)
             if can_native:
                 physical_args = allocator.rewrite_args(slots[i][1])
                 bundle.append((engine, physical_args))
@@ -467,7 +475,7 @@ def schedule_segment(slots, slot_limits, allocator):
     return bundles, sched_meta
 
 
-def schedule(slots, slot_limits=None, allocator=None):
+def schedule(slots, slot_limits=None, allocator=None, tags=None):
     """Schedule ops into bundles with integrated allocation.
 
     Splits on barrier pseudo-ops, schedules each segment independently.
@@ -476,6 +484,7 @@ def schedule(slots, slot_limits=None, allocator=None):
         slots: List of (engine, args) tuples, may include ("barrier", ())
         slot_limits: Optional dict overriding SLOT_LIMITS.
         allocator: ScratchAllocator instance.
+        tags: Optional list of dicts parallel to slots with metadata (vi, rnd, etc.)
 
     Returns:
         (bundles, sched_meta) — bundles have physical addresses
@@ -484,19 +493,25 @@ def schedule(slots, slot_limits=None, allocator=None):
         slot_limits = dict(SLOT_LIMITS)
 
     segments = []
+    seg_tags_list = []
     current = []
-    for slot in slots:
+    current_tags = []
+    for idx, slot in enumerate(slots):
         if slot[0] == "barrier":
             segments.append(current)
+            seg_tags_list.append(current_tags)
             current = []
+            current_tags = []
         else:
             current.append(slot)
+            current_tags.append(tags[idx] if tags is not None else None)
     segments.append(current)
+    seg_tags_list.append(current_tags)
 
     bundles = []
     sched_meta = []
-    for segment in segments:
-        seg_bundles, seg_meta = schedule_segment(segment, slot_limits, allocator)
+    for segment, seg_tags in zip(segments, seg_tags_list):
+        seg_bundles, seg_meta = schedule_segment(segment, slot_limits, allocator, tags=seg_tags if tags is not None else None)
         bundles.extend(seg_bundles)
         sched_meta.extend(seg_meta)
     return bundles, sched_meta
@@ -879,6 +894,15 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         body = []  # array of (engine, args) slots with virtual registers
+        body_tags = []  # parallel metadata: {"vi": ..., "rnd": ...} per slot
+
+        def emit(slot, vi=-1, rnd=-1):
+            body.append(slot)
+            body_tags.append({"vi": vi, "rnd": rnd})
+
+        def emit_all(slots, vi=-1, rnd=-1):
+            for s in slots:
+                emit(s, vi, rnd)
 
         # Pinned vregs for broadcast constants (allocated once, used throughout)
         one_vec = self.pinned_vreg("one_vec", VLEN)
@@ -886,21 +910,21 @@ class KernelBuilder:
         n_nodes_vec = self.pinned_vreg("n_nodes_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
-        body.append(("valu", ("vbroadcast", one_vec, one_const)))
-        body.append(("valu", ("vbroadcast", two_vec, two_const)))
-        body.append(("valu", ("vbroadcast", n_nodes_vec, param_vregs["n_nodes"])))
-        body.append(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
-        for k in range(4):
+        emit(("valu", ("vbroadcast", one_vec, one_const)))
+        emit(("valu", ("vbroadcast", two_vec, two_const)))
+        emit(("valu", ("vbroadcast", n_nodes_vec, param_vregs["n_nodes"])))
+        emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
+        for k in range(9):
             level_start_vec = self.pinned_vreg(f"level_start{k}_vec", VLEN)
-            body.append(("valu", ("vbroadcast", level_start_vec, self.scratch_const(2**k - 1))))
+            emit(("valu", ("vbroadcast", level_start_vec, self.scratch_const(2**k - 1))))
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
         for hi, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
             const1_vec = self.pinned_vreg(f"hash_c1_{hi}_vec", VLEN)
             const3_vec = self.pinned_vreg(f"hash_c3_{hi}_vec", VLEN)
-            body.append(("valu", ("vbroadcast", const1_vec, self.scratch_const(val1))))
-            body.append(("valu", ("vbroadcast", const3_vec, self.scratch_const(val3))))
+            emit(("valu", ("vbroadcast", const1_vec, self.scratch_const(val1))))
+            emit(("valu", ("vbroadcast", const3_vec, self.scratch_const(val3))))
             hash_const_vecs.append(const1_vec)
             hash_const_vecs.append(const3_vec)
 
@@ -917,13 +941,13 @@ class KernelBuilder:
             offset_const = self.scratch_const(vi * VLEN)
             idx_base = self.new_vreg(f"idx_base_init_v{vi}")
             val_base = self.new_vreg(f"val_base_init_v{vi}")
-            body.append(("alu", ("+", idx_base, param_vregs["inp_indices_p"], offset_const)))
-            body.append(("alu", ("+", val_base, param_vregs["inp_values_p"], offset_const)))
+            emit(("alu", ("+", idx_base, param_vregs["inp_indices_p"], offset_const)), vi=vi, rnd=-1)
+            emit(("alu", ("+", val_base, param_vregs["inp_values_p"], offset_const)), vi=vi, rnd=-1)
 
             idx_v = self.new_vreg_vec(f"idx_init_v{vi}")
             val_v = self.new_vreg_vec(f"val_init_v{vi}")
-            body.append(("load", ("vload", idx_v, idx_base)))
-            body.append(("load", ("vload", val_v, val_base)))
+            emit(("load", ("vload", idx_v, idx_base)), vi=vi, rnd=-1)
+            emit(("load", ("vload", val_v, val_base)), vi=vi, rnd=-1)
             idx_vecs.append(idx_v)
             val_vecs.append(val_v)
 
@@ -933,57 +957,57 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 3:
+            if k <= 4:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
                     preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
-                    body.extend(preload_slots)
+                    emit_all(preload_slots, rnd=rnd)
                     cached_broadcasts[k] = broadcast_vregs
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: round(4 * n_vectors / 5) - 4, 2: round(4 * n_vectors / 7) - 5, 3: round(4 * n_vectors / 9) - 4}
+            mux_count = {0: n_vectors, 1: 24, 2: 10, 3: 8, 4: 7}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 3 and vi < mux_count[k]:
+                if k <= 4 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
-                    body.extend(select_slots)
+                    emit_all(select_slots, vi=vi, rnd=rnd)
 
                 else:
                     addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
-                    body.append(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)))
+                    emit(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)), vi=vi, rnd=rnd)
 
                     # Gather node values from tree (still from main memory)
                     gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
-                    body.extend(gather_slots)
+                    emit_all(gather_slots, vi=vi, rnd=rnd)
 
                 # val = val ^ node_val
                 val_xored = self.new_vreg_vec(f"xor_r{rnd}_v{vi}")
-                body.append(("valu", ("^", val_xored, val_loaded, node_val)))
+                emit(("valu", ("^", val_xored, val_loaded, node_val)), vi=vi, rnd=rnd)
 
                 # val = myhash(val)
                 hash_slots, val_hashed = self.build_vhash(val_xored, hash_const_vecs)
-                body.extend(hash_slots)
+                emit_all(hash_slots, vi=vi, rnd=rnd)
 
                 # idx = 2*idx + 1 + (val & 1)
                 parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
                 idx_doubled_plus1 = self.new_vreg_vec(f"idx2p1_r{rnd}_v{vi}")
                 idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
 
-                body.append(("valu", ("&", parity, val_hashed, one_vec)))
-                body.append(("valu", ("multiply_add", idx_doubled_plus1, idx_loaded, two_vec, one_vec)))
-                body.append(("valu", ("+", idx_next, idx_doubled_plus1, parity)))
+                emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
+                emit(("valu", ("multiply_add", idx_doubled_plus1, idx_loaded, two_vec, one_vec)), vi=vi, rnd=rnd)
+                emit(("valu", ("+", idx_next, idx_doubled_plus1, parity)), vi=vi, rnd=rnd)
 
                 # idx = idx * (idx < n_nodes) -- wraps to 0 if out of bounds
                 in_bounds = self.new_vreg_vec(f"inbounds_r{rnd}_v{vi}")
                 idx_wrapped = self.new_vreg_vec(f"idx_wrap_r{rnd}_v{vi}")
-                body.append(("valu", ("<", in_bounds, idx_next, n_nodes_vec)))
-                body.append(("valu", ("*", idx_wrapped, idx_next, in_bounds)))
+                emit(("valu", ("<", in_bounds, idx_next, n_nodes_vec)), vi=vi, rnd=rnd)
+                emit(("valu", ("*", idx_wrapped, idx_next, in_bounds)), vi=vi, rnd=rnd)
 
                 new_idx_vecs.append(idx_wrapped)
                 new_val_vecs.append(val_hashed)
@@ -996,20 +1020,22 @@ class KernelBuilder:
             offset_const = self.scratch_const(vi * VLEN)
             idx_base = self.new_vreg(f"idx_base_final_v{vi}")
             val_base = self.new_vreg(f"val_base_final_v{vi}")
-            body.append(("alu", ("+", idx_base, param_vregs["inp_indices_p"], offset_const)))
-            body.append(("alu", ("+", val_base, param_vregs["inp_values_p"], offset_const)))
-            body.append(("store", ("vstore", idx_base, idx_vecs[vi])))
-            body.append(("store", ("vstore", val_base, val_vecs[vi])))
+            emit(("alu", ("+", idx_base, param_vregs["inp_indices_p"], offset_const)), vi=vi, rnd=rounds)
+            emit(("alu", ("+", val_base, param_vregs["inp_values_p"], offset_const)), vi=vi, rnd=rounds)
+            emit(("store", ("vstore", idx_base, idx_vecs[vi])), vi=vi, rnd=rounds)
+            emit(("store", ("vstore", val_base, val_vecs[vi])), vi=vi, rnd=rounds)
 
         # Prepend all setup loads to body for scheduling
         setup_slots = self.pending_const_loads + self.pending_mem_loads
+        setup_tags = [{"vi": -1, "rnd": -1}] * len(setup_slots)
         self.pending_const_loads.clear()
         self.pending_mem_loads.clear()
         body = setup_slots + body
+        body_tags = setup_tags + body_tags
 
         # Schedule + allocate in one pass
         allocator = ScratchAllocator(self.scratch_ptr, scratch_debug=self.scratch_debug)
-        bundles, sched_meta = schedule(body, slot_limits, allocator)
+        bundles, sched_meta = schedule(body, slot_limits, allocator, tags=body_tags)
         allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
 

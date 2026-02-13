@@ -359,7 +359,11 @@ class Machine:
                 delay = info["sched"] - info["ready"]
                 pressure = info.get("pressure", "")
                 pressure_str = f', "pressure": {pressure}' if pressure != "" else ""
-                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {delay}{pressure_str}'
+                vi = info.get("vi", "")
+                vi_str = f', "vi": {vi}' if vi != "" else ""
+                rnd = info.get("rnd", "")
+                rnd_str = f', "rnd": {rnd}' if rnd != "" else ""
+                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {delay}{pressure_str}{vi_str}{rnd_str}'
                 deps = info.get("deps", [])
                 if deps:
                     # Format: "op1@cycle1, op2@cycle2" — show blocking dep (latest) first
