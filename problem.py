@@ -39,6 +39,8 @@ class DebugInfo:
 
     # Maps scratch variable addr to (name, len) pair
     scratch_map: dict[int, (str, int)]
+    # Maps (pc, engine, slot_index) to scheduling metadata dict
+    slot_sched_info: dict[tuple, dict] = None
 
 
 def cdiv(a, b):
@@ -345,8 +347,14 @@ class Machine:
                 )
 
     def trace_slot(self, core, slot, name, i):
+        sched_str = ""
+        if self.debug_info.slot_sched_info is not None:
+            key = (core.pc - 1, name, i)
+            info = self.debug_info.slot_sched_info.get(key)
+            if info:
+                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {info["sched"] - info["ready"]}'
         self.trace.write(
-            f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}" }} }},\n'
+            f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}"{sched_str} }} }},\n'
         )
 
     def step(self, instr: Instruction, core):

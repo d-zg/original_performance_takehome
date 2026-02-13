@@ -199,10 +199,18 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
     # Step 3: List scheduling with partial valu→alu promotion
     ready = sorted([i for i in range(n) if in_degree[i] == 0])
     bundles = []
+    sched_meta = []  # parallel to bundles: list of list of {ready, sched} dicts
     partial_ops = {}  # slot_index -> elements_done_so_far
+
+    # Track when each op becomes ready
+    ready_cycle = {}
+    cycle_num = 0
+    for i in ready:
+        ready_cycle[i] = 0
 
     while ready or partial_ops:
         bundle = []
+        bundle_meta = []
         available = dict(slot_limits)
         scheduled_this_cycle = []
         remaining = []
@@ -215,6 +223,7 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
             done_so_far = partial_ops[i]
             can_do = min(alu_avail, VLEN - done_so_far)
             bundle.append(("valu_as_alu", slots[i][1], done_so_far, can_do))
+            bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
             available["alu"] -= can_do
             partial_ops[i] = done_so_far + can_do
             if partial_ops[i] >= VLEN:
@@ -240,6 +249,7 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
 
             if available.get(engine, 0) > 0:
                 bundle.append(slots[i])
+                bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
                 available[engine] -= 1
                 scheduled_this_cycle.append(i)
                 update_pressure_defs(i)
@@ -251,6 +261,7 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
                 alu_avail = available.get("alu", 0)
                 can_do = min(alu_avail, VLEN)
                 bundle.append(("valu_as_alu", slots[i][1], 0, can_do))
+                bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
                 available["alu"] -= can_do
                 if can_do >= VLEN:
                     scheduled_this_cycle.append(i)
@@ -273,11 +284,14 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
                 in_degree[succ] -= 1
                 if in_degree[succ] == 0:
                     newly_ready.append(succ)
+                    ready_cycle[succ] = cycle_num + 1
 
         # Next cycle's ready list: unscheduled from this cycle + newly unblocked
         ready = remaining + sorted(newly_ready)
         if bundle:
             bundles.append(bundle)
+            sched_meta.append(bundle_meta)
+            cycle_num += 1
         elif not partial_ops:
             if ready:
                 raise RuntimeError(
@@ -287,7 +301,7 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
                 )
             break  # all ops scheduled
 
-    return bundles
+    return bundles, sched_meta
 
 
 def schedule(slots, slot_limits=None, scratch_budget=SCRATCH_SIZE):
@@ -320,12 +334,15 @@ def schedule(slots, slot_limits=None, scratch_budget=SCRATCH_SIZE):
 
     # Schedule each segment independently
     bundles = []
+    sched_meta = []
     for segment in segments:
-        bundles.extend(schedule_segment(segment, slot_limits, scratch_budget))
-    return bundles
+        seg_bundles, seg_meta = schedule_segment(segment, slot_limits, scratch_budget)
+        bundles.extend(seg_bundles)
+        sched_meta.extend(seg_meta)
+    return bundles, sched_meta
 
 
-def expand_valu_as_alu(bundles):
+def expand_valu_as_alu(bundles, sched_meta=None):
     """Expand valu_as_alu slots into scalar alu ops.
 
     Each valu_as_alu slot is a 4-tuple: (engine, args, start, count)
@@ -333,9 +350,12 @@ def expand_valu_as_alu(bundles):
     Must be called AFTER register allocation (physical addresses assigned).
     """
     result = []
-    for bundle in bundles:
+    result_meta = [] if sched_meta is not None else None
+    for bi, bundle in enumerate(bundles):
         new_bundle = []
-        for slot in bundle:
+        new_meta = [] if sched_meta is not None else None
+        for si, slot in enumerate(bundle):
+            meta = sched_meta[bi][si] if sched_meta is not None else None
             if slot[0] == "valu_as_alu":
                 args, start, count = slot[1], slot[2], slot[3]
                 op = args[0]
@@ -344,10 +364,16 @@ def expand_valu_as_alu(bundles):
                 for i in range(start, start + count):
                     new_args = (op, dest + i) + tuple(s + i for s in sources)
                     new_bundle.append(("alu", new_args))
+                    if new_meta is not None:
+                        new_meta.append(meta)
             else:
                 new_bundle.append((slot[0], slot[1]))
+                if new_meta is not None:
+                    new_meta.append(meta)
         result.append(new_bundle)
-    return result
+        if result_meta is not None:
+            result_meta.append(new_meta)
+    return result, result_meta
 
 
 class KernelBuilder:
@@ -362,7 +388,10 @@ class KernelBuilder:
         self.pending_mem_loads = []    # ("load", dest, src) tuples to batch-emit
 
     def debug_info(self):
-        return DebugInfo(scratch_map=self.scratch_debug)
+        return DebugInfo(
+            scratch_map=self.scratch_debug,
+            slot_sched_info=getattr(self, 'slot_sched_info', None),
+        )
 
     def new_vreg(self, name_hint="", size=1):
         """Create a new unique virtual register."""
@@ -471,6 +500,8 @@ class KernelBuilder:
                     else:
                         addr = alloc_vector()
                     vreg_to_addr[vreg] = addr
+                    # Register vreg name for trace display
+                    self.scratch_debug[addr] = (vreg.name_hint or f"v{vreg.id}", vreg.size)
                 return vreg_to_addr[vreg]
             return vreg
 
@@ -532,23 +563,31 @@ class KernelBuilder:
 
         return physical_bundles
 
-    def build(self, bundles: list[list[tuple[Engine, tuple]]]):
+    def build(self, bundles: list[list[tuple[Engine, tuple]]], sched_meta=None):
         """
         Convert bundles of slots into instruction format.
 
         Args:
             bundles: List of bundles, where each bundle is a list of (engine, args) slots.
+            sched_meta: Optional parallel structure with scheduling metadata per slot.
 
         Returns:
-            List of instruction dicts: [{engine: [slot, ...], ...}, ...]
+            (instrs, slot_sched_info) where slot_sched_info maps
+            (pc, engine, slot_index_within_engine) -> metadata dict.
         """
         instrs = []
-        for bundle in bundles:
+        slot_sched_info = {}
+        for bi, bundle in enumerate(bundles):
             instr = defaultdict(list)
-            for engine, args in bundle:
+            engine_count = defaultdict(int)
+            for si, (engine, args) in enumerate(bundle):
+                slot_idx = engine_count[engine]
+                engine_count[engine] += 1
                 instr[engine].append(args)
+                if sched_meta is not None and sched_meta[bi][si] is not None:
+                    slot_sched_info[(bi, engine, slot_idx)] = sched_meta[bi][si]
             instrs.append(dict(instr))
-        return instrs
+        return instrs, slot_sched_info
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -854,7 +893,7 @@ class KernelBuilder:
         body.append(("valu", ("vbroadcast", two_vec, two_const)))
         body.append(("valu", ("vbroadcast", n_nodes_vec, param_vregs["n_nodes"])))
         body.append(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
-        for k in range(7):
+        for k in range(4):
             level_start_vec = self.pinned_vreg(f"level_start{k}_vec", VLEN)
             body.append(("valu", ("vbroadcast", level_start_vec, self.scratch_const(2**k - 1))))
 
@@ -896,21 +935,21 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 4:
+            if k <= 3:
                 preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
                 # if rnd < 10:
                 body.extend(preload_slots)
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: round(4 * n_vectors / 5) - 4, 2: round(4 * n_vectors / 7) - 5, 3: round(4 * n_vectors / 9) - 4, 4: 2}
+            mux_count = {0: n_vectors, 1: round(4 * n_vectors / 5) - 4, 2: round(4 * n_vectors / 7) - 5, 3: round(4 * n_vectors / 9) - 4}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 4 and vi < mux_count[k]:
+                if k <= 3 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     body.extend(select_slots)
 
@@ -970,13 +1009,20 @@ class KernelBuilder:
         # Schedule: pack independent ops into same cycle
         # Budget = total scratch minus what's already allocated for constants/params
         scratch_budget = SCRATCH_SIZE - self.scratch_ptr
-        bundles = schedule(body, slot_limits, scratch_budget)
+        bundles, sched_meta = schedule(body, slot_limits, scratch_budget)
 
         # Allocate physical addresses for virtual registers
         physical_bundles = self.allocate_vregs(bundles)
-        physical_bundles = expand_valu_as_alu(physical_bundles)
+        physical_bundles, sched_meta = expand_valu_as_alu(physical_bundles, sched_meta)
 
-        body_instrs = self.build(physical_bundles)
+        body_instrs, slot_sched_info = self.build(physical_bundles, sched_meta)
+
+        # Remap sched_info keys: bundle_idx -> actual PC (offset by existing instrs)
+        pc_offset = len(self.instrs)
+        self.slot_sched_info = {}
+        for (bi, engine, si), meta in slot_sched_info.items():
+            self.slot_sched_info[(pc_offset + bi, engine, si)] = meta
+
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
