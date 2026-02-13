@@ -89,24 +89,144 @@ def get_defs_uses(engine, args):
     return defs, uses
 
 
-def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
-    """Schedule a segment of ops (no barriers) using list scheduling.
+class ScratchAllocator:
+    """Manages scratch space allocation for virtual registers.
+
+    Vectors (size VLEN) scan left-to-right for free blocks.
+    Scalars (size 1) scan right-to-left for free slots.
+    No watermarks — pressure equals actual occupied words.
+    """
+
+    def __init__(self, scratch_start, scratch_size=SCRATCH_SIZE):
+        self.scratch_start = scratch_start
+        self.scratch_size = scratch_size
+        self.occupied = [False] * scratch_size
+        for i in range(scratch_start):
+            self.occupied[i] = True
+        self.vreg_to_addr = {}
+        self.peak_usage = 0
+        self.peak_cycle = -1
+        self.peak_live_snapshot = []
+
+    def try_allocate(self, vreg):
+        """Try to allocate space for a vreg. Returns address or None."""
+        if not isinstance(vreg, VReg):
+            return vreg
+        if vreg.pinned_addr is not None:
+            return vreg.pinned_addr
+        if vreg.parent is not None:
+            parent_addr = self.get_addr(vreg.parent)
+            return parent_addr + vreg.offset if parent_addr is not None else None
+        if vreg in self.vreg_to_addr:
+            return self.vreg_to_addr[vreg]
+        addr = self._find_space(vreg.size)
+        if addr is not None:
+            self.vreg_to_addr[vreg] = addr
+        return addr
+
+    def _find_space(self, size):
+        """Find free space. Vectors scan left, scalars scan right."""
+        if size == VLEN:
+            for a in range(self.scratch_start, self.scratch_size - VLEN + 1):
+                if not any(self.occupied[a:a + VLEN]):
+                    for i in range(VLEN):
+                        self.occupied[a + i] = True
+                    return a
+        else:
+            for a in range(self.scratch_size - 1, self.scratch_start - 1, -1):
+                if not self.occupied[a]:
+                    self.occupied[a] = True
+                    return a
+        return None
+
+    def free(self, vreg):
+        """Free a vreg's allocated space."""
+        if not isinstance(vreg, VReg) or vreg.pinned_addr is not None:
+            return
+        if vreg.parent is not None:
+            return  # Parent manages the space
+        if vreg not in self.vreg_to_addr:
+            return
+        addr = self.vreg_to_addr[vreg]
+        for i in range(vreg.size):
+            self.occupied[addr + i] = False
+        del self.vreg_to_addr[vreg]
+
+    def rollback(self, vreg):
+        """Undo a try_allocate."""
+        self.free(vreg)
+
+    def get_addr(self, a):
+        """Resolve a VReg or int to a physical address."""
+        if isinstance(a, VReg):
+            if a.pinned_addr is not None:
+                return a.pinned_addr
+            if a.parent is not None:
+                parent_addr = self.get_addr(a.parent)
+                return parent_addr + a.offset if parent_addr is not None else None
+            return self.vreg_to_addr.get(a)
+        return a
+
+    def rewrite_args(self, args):
+        """Rewrite instruction args, replacing VRegs with physical addresses."""
+        return tuple(self.get_addr(a) if isinstance(a, (VReg, int)) else a for a in args)
+
+    def current_usage(self):
+        """Count currently occupied dynamic words."""
+        return sum(self.occupied[self.scratch_start:])
+
+    def track_peak(self, cycle_idx):
+        """Snapshot peak usage for diagnostics."""
+        usage = self.current_usage()
+        if usage > self.peak_usage:
+            self.peak_usage = usage
+            self.peak_cycle = cycle_idx
+            self.peak_live_snapshot = [
+                (v, addr) for v, addr in self.vreg_to_addr.items()
+            ]
+
+    def print_peak_info(self):
+        """Print diagnostics about peak scratch usage."""
+        budget = self.scratch_size - self.scratch_start
+        print(f"Scratch: peak={self.peak_usage}/{budget} at cycle {self.peak_cycle}")
+        if not self.peak_live_snapshot:
+            return
+        print(f"  Live vregs at peak ({len(self.peak_live_snapshot)}):")
+        by_size = {}
+        for v, addr in self.peak_live_snapshot:
+            by_size.setdefault(v.size, []).append(v)
+        for size, vregs in sorted(by_size.items()):
+            words = len(vregs) * size
+            print(f"    size={size}: {len(vregs)} vregs ({words} words)")
+            from collections import Counter
+            prefixes = Counter()
+            for v in vregs:
+                name = v.name_hint
+                prefix = name.rsplit('_v', 1)[0] if '_v' in name else name
+                prefix = prefix.rsplit('_r', 1)[0] if '_r' in prefix else prefix
+                prefixes[prefix] += 1
+            for prefix, count in prefixes.most_common(10):
+                print(f"      {prefix}: {count}")
+
+
+def schedule_segment(slots, slot_limits, allocator):
+    """Schedule a segment of ops using list scheduling with integrated allocation.
 
     Builds a DAG from VReg def-use chains and greedily packs independent
-    ops into cycles respecting slot limits. Uses pressure-aware scheduling
-    to avoid exceeding scratch space.
+    ops into cycles, respecting slot limits. Allocates physical addresses
+    inline — no separate allocation pass needed.
 
     Args:
         slots: List of (engine, args) tuples with VRegs
         slot_limits: Dict of {engine: max_per_cycle}
-        scratch_budget: Max scratch words available for dynamic vreg allocation
+        allocator: ScratchAllocator instance for physical address management
 
     Returns:
-        List of bundles (list of list of slots)
+        (bundles, sched_meta) where bundles have physical addresses
     """
     n = len(slots)
     if n == 0:
-        return []
+        return [], []
 
     # Step 1: Compute defs/uses per slot
     slot_defs = []
@@ -117,16 +237,13 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
         slot_uses.append(u)
 
     # Step 2: Build DAG
-    # Track which slots define each VReg (handles load_offset partial defs)
-    vreg_definers = defaultdict(list)  # vreg -> [slot indices that define it]
+    vreg_definers = defaultdict(list)
     successors = [[] for _ in range(n)]
     in_degree = [0] * n
 
     for i in range(n):
-        # Add edges: i depends on all definers of VRegs it uses
         preds_for_i = set()
         for vreg in slot_uses[i]:
-            # Check both the vreg itself and its parent (for sub_vregs)
             lookup_vregs = [vreg]
             if hasattr(vreg, 'parent') and vreg.parent is not None:
                 lookup_vregs.append(vreg.parent)
@@ -136,73 +253,64 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
                         preds_for_i.add(definer)
                         successors[definer].append(i)
                         in_degree[i] += 1
-
-        # Register this slot's defs
         for vreg in slot_defs[i]:
             vreg_definers[vreg].append(i)
 
-    # Step 2.5: Compute use counts and pressure tracking for scratch-aware scheduling
+    # Step 2.5: Compute use counts for freeing
     use_count = defaultdict(int)
     for i in range(n):
         for vreg in slot_uses[i]:
-            # Track the physical vreg (parent if sub_vreg)
             v = vreg.parent if (hasattr(vreg, 'parent') and vreg.parent is not None) else vreg
             if isinstance(v, VReg) and v.pinned_addr is None:
                 use_count[v] += 1
-
     remaining_uses = dict(use_count)
-    live_vregs = set()
-    estimated_pressure = 0
 
-    def pressure_delta(i):
-        """Compute scratch pressure change if slot i is scheduled."""
-        added = 0
-        for v in slot_defs[i]:
-            if isinstance(v, VReg) and v.pinned_addr is None and v not in live_vregs:
-                added += v.size
-        freed = 0
-        for v in slot_uses[i]:
-            pv = v.parent if (hasattr(v, 'parent') and v.parent is not None) else v
-            if isinstance(pv, VReg) and pv.pinned_addr is None and pv in live_vregs:
-                if remaining_uses.get(pv, 0) == 1:
-                    freed += pv.size
+    def resolve_parent(vreg):
+        if hasattr(vreg, 'parent') and vreg.parent is not None:
+            return vreg.parent
+        return vreg
+
+    def sort_key(i):
+        """Prefer ops that free space over ops that consume space."""
+        freed = sum(resolve_parent(v).size for v in slot_uses[i]
+                    if isinstance(resolve_parent(v), VReg)
+                    and resolve_parent(v).pinned_addr is None
+                    and remaining_uses.get(resolve_parent(v), 0) == 1)
+        added = sum(v.size for v in slot_defs[i]
+                    if isinstance(v, VReg) and v.pinned_addr is None
+                    and allocator.get_addr(v) is None)
         return added - freed
 
-    pending_frees = []  # vregs to free at end of cycle (matches allocator behavior)
+    def try_alloc_defs(i):
+        """Try to allocate all defs for op i. Returns True or rolls back."""
+        allocated = []
+        for vreg in slot_defs[i]:
+            if isinstance(vreg, VReg) and vreg.pinned_addr is None:
+                addr = allocator.try_allocate(vreg)
+                if addr is None:
+                    for v in allocated:
+                        allocator.rollback(v)
+                    return False
+                allocated.append(vreg)
+        return True
 
-    def update_pressure_defs(i):
-        """Track new vreg definitions (pressure increases). Called per-op."""
-        nonlocal estimated_pressure
-        for v in slot_defs[i]:
-            if isinstance(v, VReg) and v.pinned_addr is None and v not in live_vregs:
-                live_vregs.add(v)
-                estimated_pressure += v.size
-
-    def update_pressure_uses(i):
-        """Track vreg uses and queue frees. Called per-op."""
+    def consume_uses(i):
+        """Decrement use counts, return vregs ready to free."""
+        frees = []
         for v in slot_uses[i]:
-            pv = v.parent if (hasattr(v, 'parent') and v.parent is not None) else v
+            pv = resolve_parent(v)
             if isinstance(pv, VReg) and pv.pinned_addr is None:
                 remaining_uses[pv] = remaining_uses.get(pv, 0) - 1
-                if remaining_uses[pv] == 0 and pv in live_vregs:
-                    pending_frees.append(pv)
+                if remaining_uses[pv] == 0:
+                    frees.append(pv)
+        return frees
 
-    def flush_frees():
-        """Apply pending frees at end of cycle (matches allocator's free_dead_vregs)."""
-        nonlocal estimated_pressure
-        for pv in pending_frees:
-            if pv in live_vregs:
-                live_vregs.remove(pv)
-                estimated_pressure -= pv.size
-        pending_frees.clear()
-
-    # Step 3: List scheduling with partial valu→alu promotion
+    # Step 3: List scheduling with integrated allocation
     ready = sorted([i for i in range(n) if in_degree[i] == 0])
     bundles = []
-    sched_meta = []  # parallel to bundles: list of list of {ready, sched} dicts
-    partial_ops = {}  # slot_index -> elements_done_so_far
+    sched_meta = []
+    partial_ops = {}
 
-    # Track when each op becomes ready
     ready_cycle = {}
     cycle_num = 0
     for i in ready:
@@ -214,6 +322,7 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
         available = dict(slot_limits)
         scheduled_this_cycle = []
         remaining = []
+        pending_frees = []
 
         # First: continue in-progress partial ops (priority)
         for i in list(partial_ops):
@@ -222,62 +331,68 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
                 break
             done_so_far = partial_ops[i]
             can_do = min(alu_avail, VLEN - done_so_far)
-            bundle.append(("valu_as_alu", slots[i][1], done_so_far, can_do))
+            physical_args = allocator.rewrite_args(slots[i][1])
+            bundle.append(("valu_as_alu", physical_args, done_so_far, can_do))
             bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
             available["alu"] -= can_do
             partial_ops[i] = done_so_far + can_do
             if partial_ops[i] >= VLEN:
                 del partial_ops[i]
                 scheduled_this_cycle.append(i)
-                update_pressure_defs(i)
-                update_pressure_uses(i)
+                pending_frees.extend(consume_uses(i))
 
-        # Sort ready ops: prefer those that reduce pressure (negative delta first)
-        ready.sort(key=pressure_delta)
+        # Sort ready ops: prefer those that free space
+        ready.sort(key=sort_key)
 
-        # Then: schedule new ready ops
+        # Schedule new ready ops
         for i in ready:
             engine = slots[i][0]
 
-            # Backpressure: if this op would define new vregs pushing over budget,
-            # delay it until other ops free space
-            added = sum(v.size for v in slot_defs[i]
-                        if isinstance(v, VReg) and v.pinned_addr is None and v not in live_vregs)
-            if added > 0 and estimated_pressure + added > scratch_budget:
+            # Check engine availability
+            can_native = available.get(engine, 0) > 0
+            can_promote = (engine == "valu"
+                          and slots[i][1][0] not in ("vbroadcast", "multiply_add")
+                          and available.get("alu", 0) > 0)
+
+            if not can_native and not can_promote:
                 remaining.append(i)
                 continue
 
-            if available.get(engine, 0) > 0:
-                bundle.append(slots[i])
+            # Try to allocate defs — if allocator says no room, defer
+            if not try_alloc_defs(i):
+                remaining.append(i)
+                continue
+
+            # Commit
+            if can_native:
+                physical_args = allocator.rewrite_args(slots[i][1])
+                bundle.append((engine, physical_args))
                 bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
                 available[engine] -= 1
                 scheduled_this_cycle.append(i)
-                update_pressure_defs(i)
-                update_pressure_uses(i)
-            elif (engine == "valu"
-                  and slots[i][1][0] not in ("vbroadcast", "multiply_add")
-                  and available.get("alu", 0) > 0):
-                # Partial or full valu→alu promotion
+                pending_frees.extend(consume_uses(i))
+            else:
+                # valu→alu promotion
                 alu_avail = available.get("alu", 0)
                 can_do = min(alu_avail, VLEN)
-                bundle.append(("valu_as_alu", slots[i][1], 0, can_do))
+                physical_args = allocator.rewrite_args(slots[i][1])
+                bundle.append(("valu_as_alu", physical_args, 0, can_do))
                 bundle_meta.append({"ready": ready_cycle.get(i, 0), "sched": cycle_num})
                 available["alu"] -= can_do
                 if can_do >= VLEN:
                     scheduled_this_cycle.append(i)
-                    update_pressure_defs(i)
-                    update_pressure_uses(i)
+                    pending_frees.extend(consume_uses(i))
                 else:
                     partial_ops[i] = can_do
-                    update_pressure_defs(i)  # Allocator allocates on first partial cycle
-            else:
-                remaining.append(i)
+                    # Don't consume uses yet — partial op still reading sources
 
-        # Flush frees at end of cycle (matches allocator's free_dead_vregs behavior)
-        flush_frees()
+        # End of cycle: free dead vregs
+        for vreg in pending_frees:
+            allocator.free(vreg)
 
+        allocator.track_peak(cycle_num)
 
-        # Newly ready ops (for next cycle)
+        # Newly ready ops
         newly_ready = []
         for i in scheduled_this_cycle:
             for succ in successors[i]:
@@ -286,7 +401,6 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
                     newly_ready.append(succ)
                     ready_cycle[succ] = cycle_num + 1
 
-        # Next cycle's ready list: unscheduled from this cycle + newly unblocked
         ready = remaining + sorted(newly_ready)
         if bundle:
             bundles.append(bundle)
@@ -295,33 +409,29 @@ def schedule_segment(slots, slot_limits, scratch_budget=SCRATCH_SIZE):
         elif not partial_ops:
             if ready:
                 raise RuntimeError(
-                    f"Scheduler deadlock: {len(ready)} ready ops but none schedulable. "
-                    f"estimated_pressure={estimated_pressure}/{scratch_budget}, "
-                    f"ready deltas: {[(i, pressure_delta(i)) for i in ready[:5]]}"
+                    f"Scheduler deadlock: {len(ready)} ready ops but none schedulable."
                 )
-            break  # all ops scheduled
+            break
 
     return bundles, sched_meta
 
 
-def schedule(slots, slot_limits=None, scratch_budget=SCRATCH_SIZE):
-    """Schedule ops into bundles with configurable slot limits.
+def schedule(slots, slot_limits=None, allocator=None):
+    """Schedule ops into bundles with integrated allocation.
 
     Splits on barrier pseudo-ops, schedules each segment independently.
 
     Args:
         slots: List of (engine, args) tuples, may include ("barrier", ())
-        slot_limits: Optional dict overriding SLOT_LIMITS. Keys are engine
-                     names, values are max ops per cycle for that engine.
-        scratch_budget: Max scratch words available for dynamic vreg allocation.
+        slot_limits: Optional dict overriding SLOT_LIMITS.
+        allocator: ScratchAllocator instance.
 
     Returns:
-        List of bundles (list of list of slots)
+        (bundles, sched_meta) — bundles have physical addresses
     """
     if slot_limits is None:
         slot_limits = dict(SLOT_LIMITS)
 
-    # Split on barriers
     segments = []
     current = []
     for slot in slots:
@@ -332,11 +442,10 @@ def schedule(slots, slot_limits=None, scratch_budget=SCRATCH_SIZE):
             current.append(slot)
     segments.append(current)
 
-    # Schedule each segment independently
     bundles = []
     sched_meta = []
     for segment in segments:
-        seg_bundles, seg_meta = schedule_segment(segment, slot_limits, scratch_budget)
+        seg_bundles, seg_meta = schedule_segment(segment, slot_limits, allocator)
         bundles.extend(seg_bundles)
         sched_meta.extend(seg_meta)
     return bundles, sched_meta
@@ -426,143 +535,6 @@ class KernelBuilder:
             self.const_map[val] = vreg
         return self.const_map[val]
 
-    def allocate_vregs(self, bundles):
-        """
-        Allocate physical scratch addresses for virtual registers.
-        Uses liveness analysis to reuse scratch space.
-
-        Args:
-            bundles: List of bundles, where each bundle is a list of slots.
-                     Each bundle represents one cycle.
-
-        Returns:
-            List of bundles with physical addresses instead of VRegs.
-        """
-        # Step 1: Compute liveness - find last cycle where each vreg is used
-        last_use = {}  # vreg -> cycle index of last use
-
-        def collect_vregs(args):
-            """Collect all VRegs from instruction arguments."""
-            for a in args:
-                if isinstance(a, VReg) and a.pinned_addr is None:
-                    yield a
-
-        for cycle_idx, bundle in enumerate(bundles):
-            for slot in bundle:
-                engine, args = slot[0], slot[1]
-                if engine == "debug":
-                    continue
-                for vreg in collect_vregs(args):
-                    # Sub-vregs extend their parent's liveness
-                    if vreg.parent is not None:
-                        last_use[vreg.parent] = max(last_use.get(vreg.parent, 0), cycle_idx)
-                    else:
-                        last_use[vreg] = cycle_idx
-
-        # Step 2: Allocate with scanning — no watermarks
-        # Vectors (size 8): scan left-to-right for free aligned blocks
-        # Scalars (size 1): scan right-to-left for free slots
-        # Pressure = actual occupied words, no watermark drift
-        vreg_to_addr = {}
-        occupied = [False] * SCRATCH_SIZE
-        # Mark pre-allocated region as occupied
-        for i in range(self.scratch_ptr):
-            occupied[i] = True
-
-        def alloc_vector():
-            for a in range(self.scratch_ptr, SCRATCH_SIZE - VLEN + 1):
-                if not any(occupied[a:a + VLEN]):
-                    for i in range(VLEN):
-                        occupied[a + i] = True
-                    return a
-            assert False, f"Out of scratch: no free {VLEN}-word block"
-
-        def alloc_scalar():
-            for a in range(SCRATCH_SIZE - 1, self.scratch_ptr - 1, -1):
-                if not occupied[a]:
-                    occupied[a] = True
-                    return a
-            assert False, "Out of scratch: no free scalar slot"
-
-        def free_addr(addr, size):
-            for i in range(size):
-                occupied[addr + i] = False
-
-        def get_addr(vreg):
-            if isinstance(vreg, VReg):
-                if vreg.pinned_addr is not None:
-                    return vreg.pinned_addr
-                if vreg.parent is not None:
-                    return get_addr(vreg.parent) + vreg.offset
-                if vreg not in vreg_to_addr:
-                    if vreg.size == 1:
-                        addr = alloc_scalar()
-                    else:
-                        addr = alloc_vector()
-                    vreg_to_addr[vreg] = addr
-                    # Register vreg name for trace display
-                    self.scratch_debug[addr] = (vreg.name_hint or f"v{vreg.id}", vreg.size)
-                return vreg_to_addr[vreg]
-            return vreg
-
-        def free_dead_vregs(cycle_idx):
-            """Free addresses of vregs whose last use was this cycle."""
-            dead = [v for v, last in last_use.items() if last == cycle_idx and v in vreg_to_addr]
-            for vreg in dead:
-                free_addr(vreg_to_addr[vreg], vreg.size)
-
-        def rewrite_slot(slot):
-            engine, args = slot[0], slot[1]
-            if engine == "debug":
-                return slot
-            new_args = tuple(get_addr(a) if isinstance(a, (VReg, int)) else a for a in args)
-            return (engine, new_args) + slot[2:]  # preserve start/count for valu_as_alu
-
-        physical_bundles = []
-        peak_usage = 0
-        peak_cycle = 0
-        for cycle_idx, bundle in enumerate(bundles):
-            self._debug_alloc_state = (vreg_to_addr, last_use, cycle_idx)
-            physical_bundle = [rewrite_slot(slot) for slot in bundle]
-            physical_bundles.append(physical_bundle)
-            free_dead_vregs(cycle_idx)
-
-            # Track net live scratch usage (just count occupied words)
-            net_usage = sum(occupied[self.scratch_ptr:])
-            if net_usage > peak_usage:
-                peak_usage = net_usage
-                peak_cycle = cycle_idx
-                peak_engines = [slot[0] for slot in bundle]
-                # Snapshot live vregs at peak
-                freed_vregs = set()
-                for v, last in last_use.items():
-                    if last <= cycle_idx and v in vreg_to_addr:
-                        freed_vregs.add(id(v))
-                live_vregs = [(v, vreg_to_addr[v]) for v in vreg_to_addr if id(v) not in freed_vregs]
-                peak_live = live_vregs
-
-        print(f"Scratch: peak={peak_usage}/{SCRATCH_SIZE - self.scratch_ptr} at cycle {peak_cycle} (ops: {peak_engines})")
-        print(f"  Live vregs at peak ({len(peak_live)}):")
-        by_size = {}
-        for v, addr in peak_live:
-            by_size.setdefault(v.size, []).append(v)
-        for size, vregs in sorted(by_size.items()):
-            words = len(vregs) * size
-            print(f"    size={size}: {len(vregs)} vregs ({words} words)")
-            # Show names grouped by prefix
-            from collections import Counter
-            prefixes = Counter()
-            for v in vregs:
-                name = v.name_hint
-                # Extract prefix (everything before the last _v or _r number)
-                prefix = name.rsplit('_v', 1)[0] if '_v' in name else name
-                prefix = prefix.rsplit('_r', 1)[0] if '_r' in prefix else prefix
-                prefixes[prefix] += 1
-            for prefix, count in prefixes.most_common(10):
-                print(f"      {prefix}: {count}")
-
-        return physical_bundles
-
     def build(self, bundles: list[list[tuple[Engine, tuple]]], sched_meta=None):
         """
         Convert bundles of slots into instruction format.
@@ -599,34 +571,8 @@ class KernelBuilder:
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
         if self.scratch_ptr > SCRATCH_SIZE:
-            print(f"OUT OF SCRATCH: ptr={self.scratch_ptr}/{SCRATCH_SIZE}, "
-                  f"allocating '{name}' (size={length})")
-            # Dump live vregs from allocator context
-            dbg = getattr(self, '_debug_alloc_state', None)
-            if dbg:
-                vreg_to_addr, last_use, cycle_idx = dbg
-                from collections import Counter
-                live = [(v, vreg_to_addr[v]) for v in vreg_to_addr if last_use.get(v, 0) >= cycle_idx]
-                by_size = {}
-                for v, addr in live:
-                    by_size.setdefault(v.size, []).append(v)
-                print(f"  Live vregs at cycle {cycle_idx} ({len(live)}):")
-                for size, vregs in sorted(by_size.items()):
-                    words = len(vregs) * size
-                    print(f"    size={size}: {len(vregs)} vregs ({words} words)")
-                    prefixes = Counter()
-                    for v in vregs:
-                        n = v.name_hint
-                        prefix = n.rsplit('_v', 1)[0] if '_v' in n else n
-                        prefix = prefix.rsplit('_r', 1)[0] if '_r' in prefix else prefix
-                        prefixes[prefix] += 1
-                    for prefix, count in prefixes.most_common(15):
-                        print(f"      {prefix}: {count}")
-                        if count > 5:
-                            samples = [v for v in vregs if prefix in v.name_hint][:5]
-                            for v in samples:
-                                print(f"        {v} last_use={last_use.get(v, '???')} (current cycle={cycle_idx})")
-            assert False, "Out of scratch space"
+            assert False, (f"Out of scratch: ptr={self.scratch_ptr}/{SCRATCH_SIZE}, "
+                          f"allocating '{name}' (size={length})")
         return addr
 
     def scratch_const(self, val, name=None):
@@ -931,14 +877,18 @@ class KernelBuilder:
             val_vecs.append(val_v)
 
         # Main loop: all rounds, reading/writing scratch VRegs (no memory round-trip)
+        cached_broadcasts = {}
         for rnd in range(rounds):
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
             if k <= 3:
-                preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
-                # if rnd < 10:
-                body.extend(preload_slots)
+                if k in cached_broadcasts:
+                    broadcast_vregs = cached_broadcasts[k]
+                else:
+                    preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
+                    body.extend(preload_slots)
+                    cached_broadcasts[k] = broadcast_vregs
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
@@ -1006,14 +956,11 @@ class KernelBuilder:
         self.pending_mem_loads.clear()
         body = setup_slots + body
 
-        # Schedule: pack independent ops into same cycle
-        # Budget = total scratch minus what's already allocated for constants/params
-        scratch_budget = SCRATCH_SIZE - self.scratch_ptr
-        bundles, sched_meta = schedule(body, slot_limits, scratch_budget)
-
-        # Allocate physical addresses for virtual registers
-        physical_bundles = self.allocate_vregs(bundles)
-        physical_bundles, sched_meta = expand_valu_as_alu(physical_bundles, sched_meta)
+        # Schedule + allocate in one pass
+        allocator = ScratchAllocator(self.scratch_ptr)
+        bundles, sched_meta = schedule(body, slot_limits, allocator)
+        allocator.print_peak_info()
+        physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
 
         body_instrs, slot_sched_info = self.build(physical_bundles, sched_meta)
 
