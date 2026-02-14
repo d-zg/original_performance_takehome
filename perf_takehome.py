@@ -108,6 +108,8 @@ class ScratchAllocator:
         self.peak_usage = 0
         self.peak_cycle = -1
         self.peak_live_snapshot = []
+        self.peak_scalars = 0
+        self.peak_scalars_cycle = -1
 
     def try_allocate(self, vreg):
         """Try to allocate space for a vreg. Returns address or None."""
@@ -187,11 +189,15 @@ class ScratchAllocator:
             self.peak_live_snapshot = [
                 (v, addr) for v, addr in self.vreg_to_addr.items()
             ]
+        n_scalars = sum(1 for v in self.vreg_to_addr if v.size == 1)
+        if n_scalars > self.peak_scalars:
+            self.peak_scalars = n_scalars
+            self.peak_scalars_cycle = cycle_idx
 
     def print_peak_info(self):
         """Print diagnostics about peak scratch usage."""
         budget = self.scratch_size - self.scratch_start
-        print(f"Scratch: peak={self.peak_usage}/{budget} at cycle {self.peak_cycle}")
+        print(f"Scratch: peak={self.peak_usage}/{budget} at cycle {self.peak_cycle}, peak_scalars={self.peak_scalars} at cycle {self.peak_scalars_cycle}")
         if not self.peak_live_snapshot:
             return
         print(f"  Live vregs at peak ({len(self.peak_live_snapshot)}):")
@@ -283,7 +289,29 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 named.append(a)
         return f"({engine} {' '.join(str(x) for x in named)})"
 
-    # Step 2.5: Compute use counts for freeing
+    # Step 2.5: Compute distance-to-nearest-load and distance-to-nearest-flow separately
+    from collections import deque
+
+    def bfs_dist(target_engines):
+        dist = [n] * n
+        queue = deque()
+        for i in range(n):
+            if slots[i][0] in target_engines:
+                dist[i] = 0
+                queue.append(i)
+        while queue:
+            j = queue.popleft()
+            for pred in predecessors[j]:
+                if dist[pred] > dist[j] + 1:
+                    dist[pred] = dist[j] + 1
+                    queue.append(pred)
+        return dist
+
+    dist_to_load = bfs_dist(("load",))
+    dist_to_flow = bfs_dist(("flow",))
+    dist_to_either = [min(dist_to_load[i], dist_to_flow[i]) for i in range(n)]
+
+    # Step 2.6: Compute use counts for freeing
     use_count = defaultdict(int)
     for i in range(n):
         for vreg in slot_uses[i]:
@@ -333,10 +361,18 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
         return frees
 
     # Step 3: List scheduling with integrated allocation
-    ready = sorted([i for i in range(n) if in_degree[i] == 0])
+    # Active distance map — updated each cycle based on what's starved
+    active_dist = dist_to_either  # default
+
+    def sched_key(i):
+        return (active_dist[i], sort_key(i), i)
+
+    ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
     bundles = []
     sched_meta = []
     partial_ops = {}
+    stall_slot = 0
+    stall_alloc = 0
 
     ready_cycle = {}
     op_scheduled_cycle = {}  # op index -> cycle it was scheduled
@@ -354,7 +390,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
 
     def build_meta(i):
         """Build scheduling metadata dict for op i."""
-        meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i)}
+        meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i), "dist_to_load": dist_to_load[i], "dist_to_flow": dist_to_flow[i]}
         if tags is not None and i < len(tags):
             meta.update(tags[i])
         return meta
@@ -396,8 +432,19 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 op_scheduled_cycle[i] = cycle_num
                 pending_frees.extend(consume_uses(i))
 
-        # Sort ready ops: prefer those that free space
-        ready.sort(key=sort_key)
+        # Adapt distance heuristic based on what's starved in the ready queue
+        n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
+        n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
+        load_starved = n_ready_loads < slot_limits.get("load", 2)
+        flow_starved = n_ready_flows < slot_limits.get("flow", 1)
+        if load_starved and not flow_starved:
+            active_dist = dist_to_load
+        elif flow_starved and not load_starved:
+            active_dist = dist_to_flow
+        else:
+            active_dist = dist_to_either
+
+        ready.sort(key=sched_key)
 
         # Schedule new ready ops
         for i in ready:
@@ -411,11 +458,16 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
 
             if not can_native and not can_promote:
                 remaining.append(i)
+                stall_slot += 1
                 continue
 
             # Try to allocate defs — if allocator says no room, defer
             if not try_alloc_defs(i):
                 remaining.append(i)
+                stall_alloc += 1
+                if stall_alloc <= 5:
+                    defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
+                    print(f"  alloc_fail cycle={cycle_num} op={op_desc(i)} usage={allocator.current_usage()} defs={defs_info}")
                 continue
 
             # Commit
@@ -445,11 +497,11 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                     op_scheduled_cycle[i] = cycle_num
                     # Don't consume uses yet — partial op still reading sources
 
+        allocator.track_peak(cycle_num)  # snapshot BEFORE frees (true peak)
+
         # End of cycle: free dead vregs
         for vreg in pending_frees:
             allocator.free(vreg)
-
-        allocator.track_peak(cycle_num)
 
         # Newly ready ops
         newly_ready = []
@@ -460,7 +512,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                     newly_ready.append(succ)
                     ready_cycle[succ] = cycle_num + 1
 
-        ready = remaining + sorted(newly_ready)
+        ready = sorted(remaining + newly_ready, key=sched_key)
         if bundle:
             bundles.append(bundle)
             sched_meta.append(bundle_meta)
@@ -472,6 +524,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 )
             break
 
+    print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
     return bundles, sched_meta
 
 
@@ -914,7 +967,7 @@ class KernelBuilder:
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", n_nodes_vec, param_vregs["n_nodes"])))
         emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
-        for k in range(9):
+        for k in range(3):
             level_start_vec = self.pinned_vreg(f"level_start{k}_vec", VLEN)
             emit(("valu", ("vbroadcast", level_start_vec, self.scratch_const(2**k - 1))))
 
@@ -957,7 +1010,7 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 4:
+            if k <= 1:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -967,14 +1020,14 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: 24, 2: 10, 3: 8, 4: 7}
+            mux_count = {0: n_vectors, 1: n_vectors - 2}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 4 and vi < mux_count[k]:
+                if k <= 1 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=rnd)
 

@@ -363,7 +363,9 @@ class Machine:
                 vi_str = f', "vi": {vi}' if vi != "" else ""
                 rnd = info.get("rnd", "")
                 rnd_str = f', "rnd": {rnd}' if rnd != "" else ""
-                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {delay}{pressure_str}{vi_str}{rnd_str}'
+                dtl = info.get("dist_to_load", "")
+                dtl_str = f', "dist_to_load": {dtl}' if dtl != "" else ""
+                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {delay}{pressure_str}{vi_str}{rnd_str}{dtl_str}'
                 deps = info.get("deps", [])
                 if deps:
                     # Format: "op1@cycle1, op2@cycle2" — show blocking dep (latest) first
