@@ -854,10 +854,20 @@ class KernelBuilder:
         if k == 0:
             return slots, broadcast_vregs[0]
 
+        if k == 1:
+            # Special case: just need (idx - 1) & 1, no shift needed
+            adjusted_idx = self.new_vreg_vec(f"mux1_adjusted_idx_vec{index}")
+            slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg("level_start1_vec", VLEN))))
+            bit = self.new_vreg_vec(f"bit_0_stage0_vec{index}")
+            slots.append(("valu", ("&", bit, adjusted_idx, self.pinned_vreg("one_vec", VLEN))))
+            result = self.new_vreg_vec(f"mux_stage0_vec{index}_0")
+            slots.append(("flow", ("vselect", result, bit, broadcast_vregs[1], broadcast_vregs[0])))
+            return slots, result
+
         adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx_vec{index}")
         slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(f"level_start{k}_vec", VLEN))))
 
-        for stage in range(k): 
+        for stage in range(k):
             shift_slots, condition_vreg = shift_bit(adjusted_idx, stage, stage, index)
             slots.extend(shift_slots)
             next_vregs = []
