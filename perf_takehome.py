@@ -308,7 +308,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
         return dist
 
     dist_to_load = bfs_dist(("load",))
-    dist_to_flow = bfs_dist(("flow",))
+    dist_to_flow = bfs_dist(("flow", "flex_flow"))
     dist_to_either = [min(dist_to_load[i], dist_to_flow[i]) for i in range(n)]
 
     # Step 2.6: Compute use counts for freeing
@@ -349,6 +349,12 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 allocated.append(vreg)
         return True
 
+    def rollback_defs(i):
+        """Undo allocations made by try_alloc_defs for op i."""
+        for vreg in slot_defs[i]:
+            if isinstance(vreg, VReg) and vreg.pinned_addr is None:
+                allocator.rollback(vreg)
+
     def consume_uses(i):
         """Decrement use counts, return vregs ready to free."""
         frees = []
@@ -373,6 +379,9 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
     partial_ops = {}
     stall_slot = 0
     stall_alloc = 0
+    flex_on_flow = 0
+    flex_on_valu = 0
+    flex_deferred = 0
 
     ready_cycle = {}
     op_scheduled_cycle = {}  # op index -> cycle it was scheduled
@@ -446,9 +455,48 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
 
         ready.sort(key=sched_key)
 
-        # Schedule new ready ops
+        def commit_op(i, slot_engine, emit_engine=None):
+            """Commit op i. Consumes a slot from slot_engine's budget,
+            but emits as emit_engine in the bundle (defaults to slot_engine).
+            This distinction matters for flex_flow: may consume a valu slot
+            but must emit as 'flow' since vselect is a flow instruction."""
+            if emit_engine is None:
+                emit_engine = slot_engine
+            physical_args = allocator.rewrite_args(slots[i][1])
+            meta = build_meta(i)
+            bundle.append((emit_engine, physical_args))
+            bundle_meta.append(meta)
+            available[slot_engine] -= 1
+            scheduled_this_cycle.append(i)
+            op_scheduled_cycle[i] = cycle_num
+            pending_frees.extend(consume_uses(i))
+            return True
+
+        def commit_op_as_alu(i):
+            """Commit op i via valu→alu promotion. May be partial."""
+            alu_avail = available.get("alu", 0)
+            can_do = min(alu_avail, VLEN)
+            physical_args = allocator.rewrite_args(slots[i][1])
+            meta = build_meta(i)
+            bundle.append(("valu_as_alu", physical_args, 0, can_do))
+            bundle_meta.append(meta)
+            available["alu"] -= can_do
+            if can_do >= VLEN:
+                scheduled_this_cycle.append(i)
+                op_scheduled_cycle[i] = cycle_num
+                pending_frees.extend(consume_uses(i))
+            else:
+                partial_ops[i] = can_do
+                op_scheduled_cycle[i] = cycle_num
+
+        # Schedule new ready ops (first pass: skip flex_flow)
+        deferred_flex = []
         for i in ready:
             engine = slots[i][0]
+
+            if engine == "flex_flow":
+                deferred_flex.append(i)
+                continue
 
             # Check engine availability
             can_native = available.get(engine, 0) > 0
@@ -471,31 +519,25 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 continue
 
             # Commit
-            meta = build_meta(i)
             if can_native:
-                physical_args = allocator.rewrite_args(slots[i][1])
-                bundle.append((engine, physical_args))
-                bundle_meta.append(meta)
-                available[engine] -= 1
-                scheduled_this_cycle.append(i)
-                op_scheduled_cycle[i] = cycle_num
-                pending_frees.extend(consume_uses(i))
+                commit_op(i, engine)
             else:
-                # valu→alu promotion
-                alu_avail = available.get("alu", 0)
-                can_do = min(alu_avail, VLEN)
-                physical_args = allocator.rewrite_args(slots[i][1])
-                bundle.append(("valu_as_alu", physical_args, 0, can_do))
-                bundle_meta.append(meta)
-                available["alu"] -= can_do
-                if can_do >= VLEN:
-                    scheduled_this_cycle.append(i)
-                    op_scheduled_cycle[i] = cycle_num
-                    pending_frees.extend(consume_uses(i))
-                else:
-                    partial_ops[i] = can_do
-                    op_scheduled_cycle[i] = cycle_num
-                    # Don't consume uses yet — partial op still reading sources
+                commit_op_as_alu(i)
+
+        # Second pass: flex_flow ops scavenge remaining slots (flow > valu > alu)
+        for i in deferred_flex:
+            if not try_alloc_defs(i):
+                remaining.append(i)
+                stall_alloc += 1
+                continue
+
+            if available.get("flow", 0) > 0:
+                commit_op(i, "flow")
+                flex_on_flow += 1
+            else:
+                rollback_defs(i)
+                remaining.append(i)
+                flex_deferred += 1
 
         allocator.track_peak(cycle_num)  # snapshot BEFORE frees (true peak)
 
@@ -525,6 +567,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
             break
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
+    print(f"  flex_flow: on_flow={flex_on_flow}, on_valu={flex_on_valu}, deferred={flex_deferred}")
     return bundles, sched_meta
 
 
@@ -919,13 +962,14 @@ class KernelBuilder:
 
         # Pre-load basic constants and hash constants
         self.scratch_const(0)
+        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         for _, val1, _, _, val3 in HASH_STAGES:
             self.scratch_const(val1)
             self.scratch_const(val3)
 
-        return one_const, two_const, param_vregs
+        return zero_const, one_const, two_const, param_vregs
 
     def emit_pending_loads(self):
         """Batch-emit all pending const and mem loads, packed 2 per cycle."""
@@ -951,7 +995,7 @@ class KernelBuilder:
         Each write creates a fresh vreg (SSA form).
         """
         # Setup phase: allocate scratch and register constants
-        one_const, two_const, param_vregs = self.setup_kernel_scratch_and_constants()
+        zero_const, one_const, two_const, param_vregs = self.setup_kernel_scratch_and_constants()
 
         # Emit pause immediately (no-op sync point for reference_kernel2)
         self.add("flow", ("pause",))
@@ -968,11 +1012,13 @@ class KernelBuilder:
                 emit(s, vi, rnd)
 
         # Pinned vregs for broadcast constants (allocated once, used throughout)
+        zero_vec = self.pinned_vreg("zero_vec", VLEN)
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
         n_nodes_vec = self.pinned_vreg("n_nodes_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
+        emit(("valu", ("vbroadcast", zero_vec, zero_const)))
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", n_nodes_vec, param_vregs["n_nodes"])))
@@ -1020,7 +1066,7 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 1:
+            if k <= 2:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -1030,14 +1076,14 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors - 2}
+            mux_count = {0: n_vectors, 1: n_vectors - 10, 2: 20}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 1 and vi < mux_count[k]:
+                if k <= 2 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=rnd)
 
@@ -1070,8 +1116,7 @@ class KernelBuilder:
                 in_bounds = self.new_vreg_vec(f"inbounds_r{rnd}_v{vi}")
                 idx_wrapped = self.new_vreg_vec(f"idx_wrap_r{rnd}_v{vi}")
                 emit(("valu", ("<", in_bounds, idx_next, n_nodes_vec)), vi=vi, rnd=rnd)
-                emit(("valu", ("*", idx_wrapped, idx_next, in_bounds)), vi=vi, rnd=rnd)
-
+                emit(("flex_flow", ("vselect", idx_wrapped, in_bounds, idx_next, zero_vec)), vi=vi, rnd=rnd)
                 new_idx_vecs.append(idx_wrapped)
                 new_val_vecs.append(val_hashed)
 
