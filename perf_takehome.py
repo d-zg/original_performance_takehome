@@ -308,7 +308,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
         return dist
 
     dist_to_load = bfs_dist(("load",))
-    dist_to_flow = bfs_dist(("flow", "flex_flow"))
+    dist_to_flow = bfs_dist(("flow",))
     dist_to_either = [min(dist_to_load[i], dist_to_flow[i]) for i in range(n)]
 
     # Step 2.6: Compute use counts for freeing
@@ -349,12 +349,6 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 allocated.append(vreg)
         return True
 
-    def rollback_defs(i):
-        """Undo allocations made by try_alloc_defs for op i."""
-        for vreg in slot_defs[i]:
-            if isinstance(vreg, VReg) and vreg.pinned_addr is None:
-                allocator.rollback(vreg)
-
     def consume_uses(i):
         """Decrement use counts, return vregs ready to free."""
         frees = []
@@ -379,9 +373,6 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
     partial_ops = {}
     stall_slot = 0
     stall_alloc = 0
-    flex_on_flow = 0
-    flex_on_valu = 0
-    flex_deferred = 0
     flex_alu_on_alu = 0
     flex_alu_on_flow = 0
 
@@ -446,14 +437,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
         # Adapt distance heuristic based on what's starved in the ready queue
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
-        load_starved = n_ready_loads < slot_limits.get("load", 2)
-        flow_starved = n_ready_flows < slot_limits.get("flow", 1)
-        if load_starved and not flow_starved:
-            active_dist = dist_to_load
-        elif flow_starved and not load_starved:
-            active_dist = dist_to_flow
-        else:
-            active_dist = dist_to_either
+        active_dist = dist_to_load
 
         ready.sort(key=sched_key)
 
@@ -509,14 +493,9 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
             op_scheduled_cycle[i] = cycle_num
             pending_frees.extend(consume_uses(i))
 
-        # Schedule new ready ops (first pass: skip flex_flow)
-        deferred_flex = []
+        # Schedule new ready ops
         for i in ready:
             engine = slots[i][0]
-
-            if engine == "flex_flow":
-                deferred_flex.append(i)
-                continue
 
             if engine == "flex_alu_add":
                 can_alu = available.get("alu", 0) > 0
@@ -563,21 +542,6 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
             else:
                 commit_op_as_alu(i)
 
-        # Second pass: flex_flow ops scavenge remaining slots (flow > valu > alu)
-        for i in deferred_flex:
-            if not try_alloc_defs(i):
-                remaining.append(i)
-                stall_alloc += 1
-                continue
-
-            if available.get("flow", 0) > 0:
-                commit_op(i, "flow")
-                flex_on_flow += 1
-            else:
-                rollback_defs(i)
-                remaining.append(i)
-                flex_deferred += 1
-
         allocator.track_peak(cycle_num)  # snapshot BEFORE frees (true peak)
 
         # End of cycle: free dead vregs
@@ -606,7 +570,6 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
             break
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
-    print(f"  flex_flow: on_flow={flex_on_flow}, on_valu={flex_on_valu}, deferred={flex_deferred}")
     print(f"  flex_alu_add: on_alu={flex_alu_on_alu}, on_flow={flex_alu_on_flow}")
     return bundles, sched_meta
 
@@ -1089,22 +1052,21 @@ class KernelBuilder:
               Just return it directly.
             - Shift amounts are compile-time constants, so use scratch_const.
         """
-        # Map shift amounts to existing broadcast vecs
-        _shift_vecs = {0: "zero_vec", 1: "one_vec", 2: "two_vec"}
+        # Mask vecs for bit extraction: bit s -> AND with (1 << s)
+        # vselect checks != 0, so we don't need to shift the bit down to position 0
+        _mask_vecs = {0: "one_vec", 1: "two_vec"}
 
-        def shift_bit(idx_vreg, num_bits, k, i):
-            # returns (slots, bit_vreg) where bit_vreg has the extracted bit per element
+        def extract_bit(idx_vreg, num_bits, k, i):
+            # returns (slots, bit_vreg) where bit_vreg is nonzero iff bit num_bits is set
             s = []
-            if num_bits == 0:
-                # No shift needed, just extract low bit
-                bit = self.new_vreg_vec(f"bit_0_stage{k}_vec{i}")
-                s.append(("valu", ("&", bit, idx_vreg, self.pinned_vreg("one_vec", VLEN))))
+            mask_name = _mask_vecs.get(num_bits)
+            if mask_name:
+                mask_vec = self.pinned_vreg(mask_name, VLEN)
             else:
-                shift_const_vec = self.pinned_vreg(_shift_vecs[num_bits], VLEN)
-                shifted = self.new_vreg_vec(f"shifted_{num_bits}_stage{k}_vec{i}")
-                s.append(("valu", (">>", shifted, idx_vreg, shift_const_vec)))
-                bit = self.new_vreg_vec(f"bit_{num_bits}_stage{k}_vec{i}")
-                s.append(("valu", ("&", bit, shifted, self.pinned_vreg("one_vec", VLEN))))
+                # For higher bits (k>=3), would need a new broadcast constant
+                mask_vec = self.pinned_vreg(f"mask_{1 << num_bits}_vec", VLEN)
+            bit = self.new_vreg_vec(f"bit_{num_bits}_stage{k}_vec{i}")
+            s.append(("valu", ("&", bit, idx_vreg, mask_vec)))
             return s, bit
         
         slots = []
@@ -1113,20 +1075,19 @@ class KernelBuilder:
             return slots, broadcast_vregs[0]
 
         if k == 1:
-            # Special case: just need (idx - 1) & 1, no shift needed
-            adjusted_idx = self.new_vreg_vec(f"mux1_adjusted_idx_vec{index}")
-            slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg("level_start1_vec", VLEN))))
+            # Special case: idx is always 1 or 2 at k=1. idx&1 gives inverted bit,
+            # so swap vselect args to avoid the subtract.
             bit = self.new_vreg_vec(f"bit_0_stage0_vec{index}")
-            slots.append(("valu", ("&", bit, adjusted_idx, self.pinned_vreg("one_vec", VLEN))))
+            slots.append(("valu", ("&", bit, idx_vreg, self.pinned_vreg("one_vec", VLEN))))
             result = self.new_vreg_vec(f"mux_stage0_vec{index}_0")
-            slots.append(("flow", ("vselect", result, bit, broadcast_vregs[1], broadcast_vregs[0])))
+            slots.append(("flow", ("vselect", result, bit, broadcast_vregs[0], broadcast_vregs[1])))
             return slots, result
 
         adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx_vec{index}")
         slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(f"level_start{k}_vec", VLEN))))
 
         for stage in range(k):
-            shift_slots, condition_vreg = shift_bit(adjusted_idx, stage, stage, index)
+            shift_slots, condition_vreg = extract_bit(adjusted_idx, stage, stage, index)
             slots.extend(shift_slots)
             next_vregs = []
             for i in range(max(len(remaining_vregs)//2, 1)):
@@ -1290,7 +1251,7 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: 22}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors - 10}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
