@@ -382,6 +382,8 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
     flex_on_flow = 0
     flex_on_valu = 0
     flex_deferred = 0
+    flex_alu_on_alu = 0
+    flex_alu_on_flow = 0
 
     ready_cycle = {}
     op_scheduled_cycle = {}  # op index -> cycle it was scheduled
@@ -489,6 +491,24 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                 partial_ops[i] = can_do
                 op_scheduled_cycle[i] = cycle_num
 
+        def commit_flex_alu_add(i, as_flow):
+            """Commit a flex_alu_add op as either alu or flow add_imm."""
+            physical_args = allocator.rewrite_args(slots[i][1])
+            meta = build_meta(i)
+            if as_flow:
+                # ("+", dest_phys, base_phys, const_phys, imm) -> ("add_imm", dest_phys, base_phys, imm)
+                flow_args = ("add_imm", physical_args[1], physical_args[2], physical_args[4])
+                bundle.append(("flow", flow_args))
+                available["flow"] -= 1
+            else:
+                # ("+", dest_phys, base_phys, const_phys, imm) -> ("+", dest_phys, base_phys, const_phys)
+                bundle.append(("alu", physical_args[:4]))
+                available["alu"] -= 1
+            bundle_meta.append(meta)
+            scheduled_this_cycle.append(i)
+            op_scheduled_cycle[i] = cycle_num
+            pending_frees.extend(consume_uses(i))
+
         # Schedule new ready ops (first pass: skip flex_flow)
         deferred_flex = []
         for i in ready:
@@ -496,6 +516,25 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
 
             if engine == "flex_flow":
                 deferred_flex.append(i)
+                continue
+
+            if engine == "flex_alu_add":
+                can_alu = available.get("alu", 0) > 0
+                can_flow = available.get("flow", 0) > 0
+                if not can_alu and not can_flow:
+                    remaining.append(i)
+                    stall_slot += 1
+                    continue
+                if not try_alloc_defs(i):
+                    remaining.append(i)
+                    stall_alloc += 1
+                    continue
+                if can_alu:
+                    commit_flex_alu_add(i, as_flow=False)
+                    flex_alu_on_alu += 1
+                else:
+                    commit_flex_alu_add(i, as_flow=True)
+                    flex_alu_on_flow += 1
                 continue
 
             # Check engine availability
@@ -568,6 +607,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
     print(f"  flex_flow: on_flow={flex_on_flow}, on_valu={flex_on_valu}, deferred={flex_deferred}")
+    print(f"  flex_alu_add: on_alu={flex_alu_on_alu}, on_flow={flex_alu_on_flow}")
     return bundles, sched_meta
 
 
@@ -657,6 +697,172 @@ class KernelBuilder:
         self.vregs = {}  # name -> VReg for named vregs
         self.pending_const_loads = []  # ("const", addr, val) tuples to batch-emit
         self.pending_mem_loads = []    # ("load", dest, src) tuples to batch-emit
+
+    @staticmethod
+    def _extract_timing(sched_meta):
+        """Extract per-(vi, rnd) and per-op timing from sched_meta."""
+        timing = {}  # (vi, rnd) -> {"start", "end", "ops"}
+        op_stats = []  # per-op: {"cycle", "ready", "wait", "engine", "vi", "rnd", ...}
+        engine_per_cycle = defaultdict(lambda: defaultdict(int))  # cycle -> {engine: count}
+
+        for bi, bundle_meta in enumerate(sched_meta):
+            for meta in bundle_meta:
+                if meta is None:
+                    continue
+                vi = meta.get("vi", -1)
+                rnd = meta.get("rnd", -1)
+                cycle = meta.get("sched", 0)
+                ready = meta.get("ready", 0)
+
+                # Per-op stats
+                op_stats.append({
+                    "cycle": cycle, "ready": ready, "wait": cycle - ready,
+                    "vi": vi, "rnd": rnd,
+                    "dist_to_load": meta.get("dist_to_load", -1),
+                    "dist_to_flow": meta.get("dist_to_flow", -1),
+                    "pressure": meta.get("pressure", 0),
+                    "named": meta.get("named", ""),
+                })
+
+                if vi < 0 or rnd < 0:
+                    continue
+                key = (vi, rnd)
+                if key not in timing:
+                    timing[key] = {"start": cycle, "end": cycle, "ops": 0}
+                timing[key]["start"] = min(timing[key]["start"], cycle)
+                timing[key]["end"] = max(timing[key]["end"], cycle)
+                timing[key]["ops"] += 1
+
+        return timing, op_stats
+
+    def print_timing_summary(self):
+        """Print comprehensive scheduling analysis."""
+        if not hasattr(self, 'vi_rnd_timing') or not self.vi_rnd_timing:
+            print("No timing data available.")
+            return
+        import pandas as pd
+        timing, op_stats = self.vi_rnd_timing, self._op_stats
+
+        # === 1. Per-round duration stats ===
+        rows = []
+        for (vi, rnd), t in timing.items():
+            rows.append({"vi": vi, "rnd": rnd, "start": t["start"],
+                         "end": t["end"], "duration": t["end"] - t["start"],
+                         "ops": t["ops"]})
+        df = pd.DataFrame(rows).sort_values(["rnd", "vi"])
+
+        print("\n=== Per-round duration stats ===")
+        grouped = df.groupby("rnd")
+        summary = pd.DataFrame({
+            "mean_dur": grouped["duration"].mean().round(1),
+            "min_dur": grouped["duration"].min(),
+            "max_dur": grouped["duration"].max(),
+            "spread": (grouped["duration"].max() - grouped["duration"].min()),
+            "first_start": grouped["start"].min(),
+            "last_end": grouped["end"].max(),
+            "wall_time": grouped["end"].max() - grouped["start"].min(),
+        })
+        print(summary.to_string())
+
+        # === 2. Round overlap: how many rounds are in-flight per cycle ===
+        total_cycles = df["end"].max() + 1
+        rounds_active = [0] * total_cycles
+        for _, row in df.iterrows():
+            for c in range(row["start"], row["end"] + 1):
+                rounds_active[c] = max(rounds_active[c], 1)  # just mark active
+        # Count distinct rounds active per cycle
+        rnd_per_cycle = defaultdict(set)
+        for _, row in df.iterrows():
+            for c in range(row["start"], row["end"] + 1):
+                rnd_per_cycle[c].add(row["rnd"])
+        overlap_counts = [len(rnd_per_cycle[c]) for c in range(total_cycles)]
+        if overlap_counts:
+            print(f"\n=== Round overlap ===")
+            print(f"  Max rounds in-flight: {max(overlap_counts)}")
+            avg_overlap = sum(overlap_counts) / len(overlap_counts)
+            print(f"  Avg rounds in-flight: {avg_overlap:.1f}")
+            # Drain phase: cycles where overlap drops to 1
+            drain_start = total_cycles
+            for c in range(total_cycles - 1, -1, -1):
+                if overlap_counts[c] > 1:
+                    drain_start = c + 1
+                    break
+            print(f"  Drain phase starts: cycle {drain_start} ({total_cycles - drain_start} drain cycles)")
+
+        # === 3. Op wait times (ready → scheduled delay) ===
+        ops_df = pd.DataFrame(op_stats)
+        if len(ops_df) > 0 and "wait" in ops_df.columns:
+            print(f"\n=== Op wait times (ready → scheduled) ===")
+            print(f"  Mean: {ops_df['wait'].mean():.1f}, Median: {ops_df['wait'].median():.0f}, "
+                  f"Max: {ops_df['wait'].max()}, P95: {ops_df['wait'].quantile(0.95):.0f}")
+            # Wait time by round
+            rnd_waits = ops_df[ops_df["rnd"] >= 0].groupby("rnd")["wait"]
+            if len(rnd_waits) > 0:
+                print(f"  Per-round mean wait: min={rnd_waits.mean().min():.1f}, "
+                      f"max={rnd_waits.mean().max():.1f}")
+
+        # === 4. Engine utilization from bundles ===
+        if hasattr(self, '_bundles_for_stats'):
+            bundles = self._bundles_for_stats
+            engine_counts = defaultdict(int)
+            for bundle in bundles:
+                for slot in bundle:
+                    eng = slot[0]
+                    if eng == "valu_as_alu":
+                        engine_counts["alu"] += slot[3]  # count = number of scalar ops
+                    else:
+                        engine_counts[eng] += 1
+            n_cycles = len(bundles)
+            print(f"\n=== Engine utilization ({n_cycles} cycles) ===")
+            for eng in ["valu", "alu", "load", "store", "flow"]:
+                count = engine_counts.get(eng, 0)
+                limit = SLOT_LIMITS.get(eng, 0)
+                util = count / (n_cycles * limit) * 100 if limit > 0 and n_cycles > 0 else 0
+                print(f"  {eng:6s}: {count:6d} slots used, {util:5.1f}% utilization "
+                      f"({count/n_cycles:.1f}/{limit} per cycle)")
+
+        print(f"\n=== Overall ===")
+        print(f"  Mean duration: {df['duration'].mean():.1f} cycles")
+        print(f"  Total (vi,rnd) pairs: {len(df)}")
+        return df
+
+    def plot_timing(self):
+        """Plot histograms of per-(vi, rnd) durations and a Gantt-like chart."""
+        df = self.print_timing_summary()
+        if df is None:
+            return
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+        # Histogram of durations
+        axes[0].hist(df["duration"], bins=30, edgecolor="black")
+        axes[0].set_xlabel("Duration (cycles)")
+        axes[0].set_ylabel("Count")
+        axes[0].set_title("Duration distribution (all vi×rnd)")
+
+        # Gantt chart: each row is a (vi, rnd), colored by round
+        df_sorted = df.sort_values(["rnd", "vi"])
+        colors = plt.cm.tab20(df_sorted["rnd"] % 20)
+        for idx, (_, row) in enumerate(df_sorted.iterrows()):
+            axes[1].barh(idx, row["duration"], left=row["start"],
+                        color=colors[idx], height=0.8)
+        axes[1].set_xlabel("Cycle")
+        axes[1].set_ylabel("(vi, rnd) index")
+        axes[1].set_title("Gantt: start→end per (vi, rnd)")
+
+        # Per-round box plot of durations
+        rounds = sorted(df["rnd"].unique())
+        data = [df[df["rnd"] == r]["duration"].values for r in rounds]
+        axes[2].boxplot(data, labels=[str(r) for r in rounds])
+        axes[2].set_xlabel("Round")
+        axes[2].set_ylabel("Duration (cycles)")
+        axes[2].set_title("Duration spread per round")
+
+        plt.tight_layout()
+        plt.savefig("timing_analysis.png", dpi=150)
+        plt.show()
+        print("Saved timing_analysis.png")
 
     def debug_info(self):
         return DebugInfo(
@@ -817,15 +1023,17 @@ class KernelBuilder:
         slots = []
         n_nodes = 2 ** k
 
-        level_offset = self.scratch_const(2**k - 1)
+        level_offset_imm = 2**k - 1
+        level_offset = self.scratch_const(level_offset_imm)
         level_base = self.new_vreg(f"level{k}_base")
-        slots.append(("alu", ("+", level_base, forest_values_p_addr, level_offset)))
+        slots.append(("flex_alu_add", ("+", level_base, forest_values_p_addr, level_offset, level_offset_imm)))
         vregs = []
 
         for i in range(max(n_nodes//8, 1)):
             current_offset = self.new_vreg(f"level{k}_offset_{i}")
-            offset_constant = self.scratch_const(i*VLEN)
-            slots.append(("alu", ("+", current_offset, level_base, offset_constant)))
+            offset_imm = i * VLEN
+            offset_constant = self.scratch_const(offset_imm)
+            slots.append(("flex_alu_add", ("+", current_offset, level_base, offset_constant, offset_imm)))
             vnode_vreg = self.new_vreg_vec(f"level{k}_offset_node_{i}")
             slots.append(("load", ("vload", vnode_vreg, current_offset)))
             vregs.append(vnode_vreg)
@@ -881,15 +1089,22 @@ class KernelBuilder:
               Just return it directly.
             - Shift amounts are compile-time constants, so use scratch_const.
         """
+        # Map shift amounts to existing broadcast vecs
+        _shift_vecs = {0: "zero_vec", 1: "one_vec", 2: "two_vec"}
+
         def shift_bit(idx_vreg, num_bits, k, i):
             # returns (slots, bit_vreg) where bit_vreg has the extracted bit per element
             s = []
-            shift_const_vec = self.pinned_vreg(f"shift_{num_bits}_vec", VLEN)
-            s.append(("valu", ("vbroadcast", shift_const_vec, self.scratch_const(num_bits))))
-            shifted = self.new_vreg_vec(f"shifted_{num_bits}_stage{k}_vec{i}")
-            s.append(("valu", (">>", shifted, idx_vreg, shift_const_vec)))
-            bit = self.new_vreg_vec(f"bit_{num_bits}_stage{k}_vec{i}")
-            s.append(("valu", ("&", bit, shifted, self.pinned_vreg("one_vec", VLEN))))
+            if num_bits == 0:
+                # No shift needed, just extract low bit
+                bit = self.new_vreg_vec(f"bit_0_stage{k}_vec{i}")
+                s.append(("valu", ("&", bit, idx_vreg, self.pinned_vreg("one_vec", VLEN))))
+            else:
+                shift_const_vec = self.pinned_vreg(_shift_vecs[num_bits], VLEN)
+                shifted = self.new_vreg_vec(f"shifted_{num_bits}_stage{k}_vec{i}")
+                s.append(("valu", (">>", shifted, idx_vreg, shift_const_vec)))
+                bit = self.new_vreg_vec(f"bit_{num_bits}_stage{k}_vec{i}")
+                s.append(("valu", ("&", bit, shifted, self.pinned_vreg("one_vec", VLEN))))
             return s, bit
         
         slots = []
@@ -1015,13 +1230,11 @@ class KernelBuilder:
         zero_vec = self.pinned_vreg("zero_vec", VLEN)
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
-        n_nodes_vec = self.pinned_vreg("n_nodes_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
         emit(("valu", ("vbroadcast", zero_vec, zero_const)))
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
-        emit(("valu", ("vbroadcast", n_nodes_vec, param_vregs["n_nodes"])))
         emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
         for k in range(3):
             level_start_vec = self.pinned_vreg(f"level_start{k}_vec", VLEN)
@@ -1047,11 +1260,12 @@ class KernelBuilder:
         idx_vecs = []  # current index vector per vi chunk
         val_vecs = []  # current value vector per vi chunk
         for vi in range(n_vectors):
-            offset_const = self.scratch_const(vi * VLEN)
+            offset_imm = vi * VLEN
+            offset_const = self.scratch_const(offset_imm)
             idx_base = self.new_vreg(f"idx_base_init_v{vi}")
             val_base = self.new_vreg(f"val_base_init_v{vi}")
-            emit(("alu", ("+", idx_base, param_vregs["inp_indices_p"], offset_const)), vi=vi, rnd=-1)
-            emit(("alu", ("+", val_base, param_vregs["inp_values_p"], offset_const)), vi=vi, rnd=-1)
+            emit(("flex_alu_add", ("+", idx_base, param_vregs["inp_indices_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
+            emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
 
             idx_v = self.new_vreg_vec(f"idx_init_v{vi}")
             val_v = self.new_vreg_vec(f"val_init_v{vi}")
@@ -1076,7 +1290,7 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors - 10, 2: 20}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: 22}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
@@ -1103,21 +1317,20 @@ class KernelBuilder:
                 hash_slots, val_hashed = self.build_vhash(val_xored, hash_const_vecs)
                 emit_all(hash_slots, vi=vi, rnd=rnd)
 
-                # idx = 2*idx + 1 + (val & 1)
-                parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
-                idx_doubled_plus1 = self.new_vreg_vec(f"idx2p1_r{rnd}_v{vi}")
-                idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
+                if k == forest_height:
+                    # At leaves: idx always wraps to 0, skip entire idx computation
+                    new_idx_vecs.append(zero_vec)
+                else:
+                    # idx = 2*idx + 1 + (val & 1)
+                    parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
+                    idx_doubled_plus1 = self.new_vreg_vec(f"idx2p1_r{rnd}_v{vi}")
+                    idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
 
-                emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
-                emit(("valu", ("multiply_add", idx_doubled_plus1, idx_loaded, two_vec, one_vec)), vi=vi, rnd=rnd)
-                emit(("valu", ("+", idx_next, idx_doubled_plus1, parity)), vi=vi, rnd=rnd)
+                    emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
+                    emit(("valu", ("multiply_add", idx_doubled_plus1, idx_loaded, two_vec, one_vec)), vi=vi, rnd=rnd)
+                    emit(("valu", ("+", idx_next, idx_doubled_plus1, parity)), vi=vi, rnd=rnd)
+                    new_idx_vecs.append(idx_next)
 
-                # idx = idx * (idx < n_nodes) -- wraps to 0 if out of bounds
-                in_bounds = self.new_vreg_vec(f"inbounds_r{rnd}_v{vi}")
-                idx_wrapped = self.new_vreg_vec(f"idx_wrap_r{rnd}_v{vi}")
-                emit(("valu", ("<", in_bounds, idx_next, n_nodes_vec)), vi=vi, rnd=rnd)
-                emit(("flex_flow", ("vselect", idx_wrapped, in_bounds, idx_next, zero_vec)), vi=vi, rnd=rnd)
-                new_idx_vecs.append(idx_wrapped)
                 new_val_vecs.append(val_hashed)
 
             idx_vecs = new_idx_vecs
@@ -1125,11 +1338,12 @@ class KernelBuilder:
 
         # Store final results back to memory (once)
         for vi in range(n_vectors):
-            offset_const = self.scratch_const(vi * VLEN)
+            offset_imm = vi * VLEN
+            offset_const = self.scratch_const(offset_imm)
             idx_base = self.new_vreg(f"idx_base_final_v{vi}")
             val_base = self.new_vreg(f"val_base_final_v{vi}")
-            emit(("alu", ("+", idx_base, param_vregs["inp_indices_p"], offset_const)), vi=vi, rnd=rounds)
-            emit(("alu", ("+", val_base, param_vregs["inp_values_p"], offset_const)), vi=vi, rnd=rounds)
+            emit(("flex_alu_add", ("+", idx_base, param_vregs["inp_indices_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
+            emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
             emit(("store", ("vstore", idx_base, idx_vecs[vi])), vi=vi, rnd=rounds)
             emit(("store", ("vstore", val_base, val_vecs[vi])), vi=vi, rnd=rounds)
 
@@ -1146,6 +1360,10 @@ class KernelBuilder:
         bundles, sched_meta = schedule(body, slot_limits, allocator, tags=body_tags)
         allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
+
+        # Extract per-(vi, rnd) timing and per-op stats from sched_meta
+        self.vi_rnd_timing, self._op_stats = self._extract_timing(sched_meta)
+        self._bundles_for_stats = physical_bundles
 
         body_instrs, slot_sched_info = self.build(physical_bundles, sched_meta)
 
@@ -1169,6 +1387,7 @@ def do_kernel_test(
     trace: bool = False,
     prints: bool = False,
     slot_limits=None,
+    plot: bool = False,
 ):
     print(f"{forest_height=}, {rounds=}, {batch_size=}")
     random.seed(seed)
@@ -1210,6 +1429,14 @@ def do_kernel_test(
 
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
+
+    try:
+        kb.print_timing_summary()
+        if plot:
+            kb.plot_timing()
+    except ImportError:
+        pass
+
     return machine.cycle
 
 
@@ -1260,4 +1487,9 @@ class Tests(unittest.TestCase):
 #    python tests/submission_tests.py
 
 if __name__ == "__main__":
-    unittest.main()
+    import sys
+    if "--plot" in sys.argv:
+        sys.argv.remove("--plot")
+        do_kernel_test(10, 16, 256, plot=True)
+    else:
+        unittest.main()
