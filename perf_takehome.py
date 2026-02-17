@@ -437,7 +437,14 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
         # Adapt distance heuristic based on what's starved in the ready queue
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
-        active_dist = dist_to_load
+        load_starved = n_ready_loads < slot_limits.get("load", 2)
+        flow_starved = n_ready_flows < slot_limits.get("flow", 1)
+        if load_starved and not flow_starved:
+            active_dist = dist_to_load
+        elif flow_starved and not load_starved:
+            active_dist = dist_to_flow
+        else:
+            active_dist = dist_to_either
 
         ready.sort(key=sched_key)
 
@@ -935,15 +942,18 @@ class KernelBuilder:
             const1_vec = hash_const_vecs[hi * 2]
             const3_vec = hash_const_vecs[hi * 2 + 1]
 
-            # Create fresh vregs for this stage's outputs
-            tmp1 = self.new_vreg_vec(f"hash{hi}_t1")
-            tmp2 = self.new_vreg_vec(f"hash{hi}_t2")
-            val_out = self.new_vreg_vec(f"hash{hi}_out")
-
-            # tmp1 = op1(val, const1) and tmp2 = op3(val, const3) - independent
-            slots.append(("valu", (op1, tmp1, val_vec, const1_vec)))
-            slots.append(("valu", (op3, tmp2, val_vec, const3_vec)))
-            slots.append(("valu", (op2, val_out, tmp1, tmp2)))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # Fuse: (a + const) + (a << N) = a * (2^N + 1) + const
+                val_out = self.new_vreg_vec(f"hash{hi}_out")
+                slots.append(("valu", ("multiply_add", val_out, val_vec, const3_vec, const1_vec)))
+            else:
+                # General case: 3 ops
+                tmp1 = self.new_vreg_vec(f"hash{hi}_t1")
+                tmp2 = self.new_vreg_vec(f"hash{hi}_t2")
+                val_out = self.new_vreg_vec(f"hash{hi}_out")
+                slots.append(("valu", (op1, tmp1, val_vec, const1_vec)))
+                slots.append(("valu", (op3, tmp2, val_vec, const3_vec)))
+                slots.append(("valu", (op2, val_out, tmp1, tmp2)))
 
             val_vec = val_out  # Chain to next stage
 
@@ -1054,7 +1064,7 @@ class KernelBuilder:
         """
         # Mask vecs for bit extraction: bit s -> AND with (1 << s)
         # vselect checks != 0, so we don't need to shift the bit down to position 0
-        _mask_vecs = {0: "one_vec", 1: "two_vec"}
+        _mask_vecs = {0: "one_vec", 1: "two_vec", 2: "four_vec"}
 
         def extract_bit(idx_vreg, num_bits, k, i):
             # returns (slots, bit_vreg) where bit_vreg is nonzero iff bit num_bits is set
@@ -1191,23 +1201,31 @@ class KernelBuilder:
         zero_vec = self.pinned_vreg("zero_vec", VLEN)
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
+        four_vec = self.pinned_vreg("four_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
         emit(("valu", ("vbroadcast", zero_vec, zero_const)))
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
+        emit(("valu", ("vbroadcast", four_vec, self.scratch_const(4))))
         emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
-        for k in range(3):
-            level_start_vec = self.pinned_vreg(f"level_start{k}_vec", VLEN)
-            emit(("valu", ("vbroadcast", level_start_vec, self.scratch_const(2**k - 1))))
+        # Level start broadcasts for mux subtract (k=0 unused, k=1 uses idx&1 directly)
+        level_start2_vec = self.pinned_vreg("level_start2_vec", VLEN)
+        emit(("valu", ("vbroadcast", level_start2_vec, self.scratch_const(3))))
+        level_start3_vec = self.pinned_vreg("level_start3_vec", VLEN)
+        emit(("valu", ("vbroadcast", level_start3_vec, self.scratch_const(7))))
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
-        for hi, (_, val1, _, _, val3) in enumerate(HASH_STAGES):
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             const1_vec = self.pinned_vreg(f"hash_c1_{hi}_vec", VLEN)
             const3_vec = self.pinned_vreg(f"hash_c3_{hi}_vec", VLEN)
             emit(("valu", ("vbroadcast", const1_vec, self.scratch_const(val1))))
-            emit(("valu", ("vbroadcast", const3_vec, self.scratch_const(val3))))
+            if op1 == "+" and op2 == "+" and op3 == "<<":
+                # For fusable stages, const3 becomes the multiplier 2^N + 1
+                emit(("valu", ("vbroadcast", const3_vec, self.scratch_const((1 << val3) + 1))))
+            else:
+                emit(("valu", ("vbroadcast", const3_vec, self.scratch_const(val3))))
             hash_const_vecs.append(const1_vec)
             hash_const_vecs.append(const3_vec)
 
@@ -1241,7 +1259,7 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 2:
+            if k <= 3:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -1251,14 +1269,14 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors - 10}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 2 and vi < mux_count[k]:
+                if k <= 3 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=rnd)
 
@@ -1391,12 +1409,12 @@ def do_kernel_test(
     print("CYCLES: ", machine.cycle)
     print("Speedup over baseline: ", BASELINE / machine.cycle)
 
-    try:
-        kb.print_timing_summary()
-        if plot:
+    if plot:
+        try:
+            kb.print_timing_summary()
             kb.plot_timing()
-    except ImportError:
-        pass
+        except ImportError:
+            pass
 
     return machine.cycle
 
