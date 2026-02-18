@@ -15,8 +15,7 @@ anything in the tests/ folder.
 
 We recommend you look through problem.py next.
 """
-import copy
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
 import random
 import unittest
 
@@ -70,7 +69,7 @@ def get_defs_uses(engine, args):
     Returns (defs: set[VReg], uses: set[VReg]).
     Tracks ALL VRegs including pinned ones for dependency analysis.
     """
-    if engine in ("debug", "barrier"):
+    if engine == "debug":
         return set(), set()
 
     if engine == "store":
@@ -207,7 +206,6 @@ class ScratchAllocator:
         for size, vregs in sorted(by_size.items()):
             words = len(vregs) * size
             print(f"    size={size}: {len(vregs)} vregs ({words} words)")
-            from collections import Counter
             prefixes = Counter()
             for v in vregs:
                 name = v.name_hint
@@ -218,7 +216,7 @@ class ScratchAllocator:
                 print(f"      {prefix}: {count}")
 
 
-def schedule_segment(slots, slot_limits, allocator, tags=None):
+def schedule(slots, slot_limits, allocator, tags=None):
     """Schedule a segment of ops using list scheduling with integrated allocation.
 
     Builds a DAG from VReg def-use chains and greedily packs independent
@@ -290,8 +288,6 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
         return f"({engine} {' '.join(str(x) for x in named)})"
 
     # Step 2.5: Compute distance-to-nearest-load and distance-to-nearest-flow separately
-    from collections import deque
-
     def bfs_dist(target_engines):
         dist = [n] * n
         queue = deque()
@@ -506,8 +502,7 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
 
             if engine == "flex_alu_add":
                 can_alu = available.get("alu", 0) > 0
-                can_flow = available.get("flow", 0) > 0
-                if not can_alu and not can_flow:
+                if not can_alu:
                     remaining.append(i)
                     stall_slot += 1
                     continue
@@ -515,12 +510,8 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
                     remaining.append(i)
                     stall_alloc += 1
                     continue
-                if can_alu:
-                    commit_flex_alu_add(i, as_flow=False)
-                    flex_alu_on_alu += 1
-                else:
-                    commit_flex_alu_add(i, as_flow=True)
-                    flex_alu_on_flow += 1
+                commit_flex_alu_add(i, as_flow=False)
+                flex_alu_on_alu += 1
                 continue
 
             # Check engine availability
@@ -581,48 +572,6 @@ def schedule_segment(slots, slot_limits, allocator, tags=None):
     return bundles, sched_meta
 
 
-def schedule(slots, slot_limits=None, allocator=None, tags=None):
-    """Schedule ops into bundles with integrated allocation.
-
-    Splits on barrier pseudo-ops, schedules each segment independently.
-
-    Args:
-        slots: List of (engine, args) tuples, may include ("barrier", ())
-        slot_limits: Optional dict overriding SLOT_LIMITS.
-        allocator: ScratchAllocator instance.
-        tags: Optional list of dicts parallel to slots with metadata (vi, rnd, etc.)
-
-    Returns:
-        (bundles, sched_meta) — bundles have physical addresses
-    """
-    if slot_limits is None:
-        slot_limits = dict(SLOT_LIMITS)
-
-    segments = []
-    seg_tags_list = []
-    current = []
-    current_tags = []
-    for idx, slot in enumerate(slots):
-        if slot[0] == "barrier":
-            segments.append(current)
-            seg_tags_list.append(current_tags)
-            current = []
-            current_tags = []
-        else:
-            current.append(slot)
-            current_tags.append(tags[idx] if tags is not None else None)
-    segments.append(current)
-    seg_tags_list.append(current_tags)
-
-    bundles = []
-    sched_meta = []
-    for segment, seg_tags in zip(segments, seg_tags_list):
-        seg_bundles, seg_meta = schedule_segment(segment, slot_limits, allocator, tags=seg_tags if tags is not None else None)
-        bundles.extend(seg_bundles)
-        sched_meta.extend(seg_meta)
-    return bundles, sched_meta
-
-
 def expand_valu_as_alu(bundles, sched_meta=None):
     """Expand valu_as_alu slots into scalar alu ops.
 
@@ -673,7 +622,6 @@ class KernelBuilder:
         """Extract per-(vi, rnd) and per-op timing from sched_meta."""
         timing = {}  # (vi, rnd) -> {"start", "end", "ops"}
         op_stats = []  # per-op: {"cycle", "ready", "wait", "engine", "vi", "rnd", ...}
-        engine_per_cycle = defaultdict(lambda: defaultdict(int))  # cycle -> {engine: count}
 
         for bi, bundle_meta in enumerate(sched_meta):
             for meta in bundle_meta:
@@ -863,16 +811,6 @@ class KernelBuilder:
             self.vregs[name] = vreg
         return self.vregs[name]
 
-    def pinned_const(self, val, name=None):
-        """Get a pinned vreg for a constant value."""
-        if val not in self.const_map:
-            vreg_name = name or f"const_{val}"
-            addr = self.alloc_scratch(vreg_name)
-            self.add("load", ("const", addr, val))
-            vreg = VReg(name_hint=vreg_name, size=1, pinned_addr=addr)
-            self.const_map[val] = vreg
-        return self.const_map[val]
-
     def build(self, bundles: list[list[tuple[Engine, tuple]]], sched_meta=None):
         """
         Convert bundles of slots into instruction format.
@@ -921,17 +859,6 @@ class KernelBuilder:
             self.const_map[val] = vreg
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
-        slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
-        return slots
-
     def build_vhash(self, val_in, hash_const_vecs):
         """Vectorized hash - operates on VLEN elements at once.
         Uses virtual registers. Returns (slots, val_out) where val_out is the result vreg."""
@@ -960,38 +887,13 @@ class KernelBuilder:
         return slots, val_vec
 
     def preload_level(self, k, forest_values_p_addr):
-        """Preload all node values at tree level k into broadcast vectors.
+        """Preload all 2^k node values at tree level k into broadcast vectors.
 
-        Args:
-            k: tree level (0 = root). Level k has 2^k nodes starting at
-               tree index (2^k - 1) in the implicit binary tree.
-            forest_values_p_addr: scalar scratch addr holding base pointer
-               to tree values in main memory.
+        Level k has 2^k nodes starting at tree index (2^k - 1).
+        Loads them via vload (8 words at a time), then vbroadcasts each
+        scalar into its own vector vreg for use by build_mux_select.
 
-        Returns:
-            (slots, broadcast_vregs) where:
-            - slots: list of (engine, args) to append to body
-            - broadcast_vregs: list of 2^k vector vregs, each containing
-              one node value broadcast across VLEN elements
-
-        Steps:
-            1. Compute the memory base address for this level:
-               level_base = forest_values_p + (2^k - 1)
-               (2^k - 1 is a build-time constant, so use scratch_const)
-
-            2. vload the 2^k values into scratch. Each vload brings in 8
-               contiguous words, so you need ceil(2^k / 8) vloads. But here
-               2^k might be < 8 (levels 0-2), so for those you'll need
-               individual scalar loads instead.
-
-            3. vbroadcast each loaded scalar value into its own vector vreg.
-               These are the outputs the mux tree will consume.
-
-        Watch out for:
-            - Levels 0-2 have fewer than 8 nodes, so vload won't work cleanly.
-              Use individual "load" ops for those, or load 8 and ignore extras.
-            - Each vload needs a scalar vreg holding the memory address to
-              load from. You'll need to increment that address between vloads.
+        Returns (slots, broadcast_vregs).
         """
         slots = []
         n_nodes = 2 ** k
@@ -1022,49 +924,16 @@ class KernelBuilder:
 
 
     def build_mux_select(self, broadcast_vregs, idx_vreg, k, index):
-        """Select each element's node value from preloaded level using a vselect mux tree.
+        """Select each element's node value from preloaded broadcast vectors using a mux tree.
 
-        Args:
-            broadcast_vregs: list of 2^k vector vregs from preload_level,
-                each containing one node value broadcast across VLEN.
-            idx_vreg: vector vreg holding current tree indices for this
-                vector group (each element is a tree node index).
-            k: tree level (broadcast_vregs has 2^k entries).
+        Extracts position bits from idx_vreg and uses k stages of vselect
+        to narrow 2^k candidates down to 1 per element.
 
-        Returns:
-            (slots, result_vreg) where result_vreg is a vector vreg
-            containing the selected node value per element.
-
-        Steps:
-            1. Compute position within level:
-               position = idx - (2^k - 1)
-               This is a vector subtract using a broadcast constant.
-
-            2. Mux tree, k stages from MSB to LSB:
-               For stage s (0 to k-1):
-                 a. Extract bit (k-1-s) from position:
-                    bit = (position >> (k-1-s)) & 1
-                    This needs a shift and an AND, both valu ops.
-
-                 b. vselect pairs of candidates:
-                    For each pair (candidates[2j], candidates[2j+1]):
-                      result = vselect(bit, candidates[2j+1], candidates[2j])
-                    This halves the candidate list each stage.
-
-               Note: vselect(cond, a, b) returns a[i] if cond[i]!=0, else b[i].
-               So bit=1 picks candidates[2j+1] (right child path),
-               bit=0 picks candidates[2j] (left child path).
-
-            3. After k stages, one candidate remains — that's the result.
-
-        Watch out for:
-            - k=0 is a special case: only 1 broadcast vreg, no mux needed.
-              Just return it directly.
-            - Shift amounts are compile-time constants, so use scratch_const.
+        Returns (slots, result_vreg).
         """
         # Mask vecs for bit extraction: bit s -> AND with (1 << s)
         # vselect checks != 0, so we don't need to shift the bit down to position 0
-        _mask_vecs = {0: "one_vec", 1: "two_vec", 2: "four_vec"}
+        _mask_vecs = {0: "one_vec", 1: "two_vec", 2: "four_vec", 3: "eight_vec"}
 
         def extract_bit(idx_vreg, num_bits, k, i):
             # returns (slots, bit_vreg) where bit_vreg is nonzero iff bit num_bits is set
@@ -1121,10 +990,9 @@ class KernelBuilder:
         return slots, dest_vec
 
     def setup_kernel_scratch_and_constants(self):
-        """
-        Allocate scratch space and set up initial constants.
-        Collects loads into pending lists for batch emission.
-        Returns (one_const, two_const).
+        """Allocate scratch space, load kernel parameters, and register constants.
+
+        Returns (zero_const, one_const, two_const, param_vregs).
         """
         # Scratch space addresses for kernel parameters
         init_vars = [
@@ -1147,7 +1015,6 @@ class KernelBuilder:
             self.pending_mem_loads.append(("load", ("load", param_vregs[v], tmp)))
 
         # Pre-load basic constants and hash constants
-        self.scratch_const(0)
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
@@ -1156,21 +1023,6 @@ class KernelBuilder:
             self.scratch_const(val3)
 
         return zero_const, one_const, two_const, param_vregs
-
-    def emit_pending_loads(self):
-        """Batch-emit all pending const and mem loads, packed 2 per cycle."""
-        # Const loads first (all independent)
-        for i in range(0, len(self.pending_const_loads), 2):
-            chunk = self.pending_const_loads[i:i+2]
-            self.instrs.append({"load": chunk})
-
-        # Mem loads second (each depends on its const, but independent of each other)
-        for i in range(0, len(self.pending_mem_loads), 2):
-            chunk = self.pending_mem_loads[i:i+2]
-            self.instrs.append({"load": chunk})
-
-        self.pending_const_loads.clear()
-        self.pending_mem_loads.clear()
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
@@ -1202,18 +1054,22 @@ class KernelBuilder:
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
         four_vec = self.pinned_vreg("four_vec", VLEN)
+        eight_vec = self.pinned_vreg("eight_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
         emit(("valu", ("vbroadcast", zero_vec, zero_const)))
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", four_vec, self.scratch_const(4))))
+        emit(("valu", ("vbroadcast", eight_vec, self.scratch_const(8))))
         emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
         # Level start broadcasts for mux subtract (k=0 unused, k=1 uses idx&1 directly)
         level_start2_vec = self.pinned_vreg("level_start2_vec", VLEN)
         emit(("valu", ("vbroadcast", level_start2_vec, self.scratch_const(3))))
         level_start3_vec = self.pinned_vreg("level_start3_vec", VLEN)
         emit(("valu", ("vbroadcast", level_start3_vec, self.scratch_const(7))))
+        level_start4_vec = self.pinned_vreg("level_start4_vec", VLEN)
+        emit(("valu", ("vbroadcast", level_start4_vec, self.scratch_const(15))))
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
@@ -1259,7 +1115,7 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 3:
+            if k <= 4:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -1269,14 +1125,14 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 3}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 3 and vi < mux_count[k]:
+                if k <= 4 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=rnd)
 
@@ -1336,7 +1192,7 @@ class KernelBuilder:
 
         # Schedule + allocate in one pass
         allocator = ScratchAllocator(self.scratch_ptr, scratch_debug=self.scratch_debug)
-        bundles, sched_meta = schedule(body, slot_limits, allocator, tags=body_tags)
+        bundles, sched_meta = schedule(body, slot_limits or dict(SLOT_LIMITS), allocator, tags=body_tags)
         allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
 
@@ -1377,7 +1233,6 @@ def do_kernel_test(
     kb = KernelBuilder()
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds,
                      slot_limits=slot_limits)
-    # print(kb.instrs)
 
     value_trace = {}
     machine = Machine(
@@ -1436,17 +1291,7 @@ class Tests(unittest.TestCase):
             assert inp.values == mem[mem[6] : mem[6] + len(inp.values)]
 
     def test_kernel_trace(self):
-        # Full-scale example for performance testing
         do_kernel_test(10, 16, 256, trace=True, prints=False)
-
-    # Passing this test is not required for submission, see submission_tests.py for the actual correctness test
-    # You can uncomment this if you think it might help you debug
-    # def test_kernel_correctness(self):
-    #     for batch in range(1, 3):
-    #         for forest_height in range(3):
-    #             do_kernel_test(
-    #                 forest_height + 2, forest_height + 4, batch * 16 * VLEN * N_CORES
-    #             )
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
