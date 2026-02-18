@@ -16,6 +16,7 @@ anything in the tests/ folder.
 We recommend you look through problem.py next.
 """
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 import random
 import unittest
 
@@ -262,12 +263,17 @@ def compute_distances(slots, predecessors):
     """
     n = len(slots)
 
-    def bfs_dist(target_engines):
+    def is_const_load(i):
+        return slots[i][0] == "load" and len(slots[i][1]) > 0 and slots[i][1][0] == "const"
+
+    def bfs_dist(target_engines, skip_fn=None):
         dist = [n] * n
         target = [-1] * n  # which specific bottleneck op this feeds
         queue = deque()
         for i in range(n):
             if slots[i][0] in target_engines:
+                if skip_fn and skip_fn(i):
+                    continue
                 dist[i] = 0
                 target[i] = i
                 queue.append(i)
@@ -280,7 +286,7 @@ def compute_distances(slots, predecessors):
                     queue.append(pred)
         return dist, target
 
-    dist_to_load, target_load = bfs_dist(("load",))
+    dist_to_load, target_load = bfs_dist(("load",), skip_fn=is_const_load)
     dist_to_flow, target_flow = bfs_dist(("flow",))
     dist_to_either = [min(dist_to_load[i], dist_to_flow[i]) for i in range(n)]
     return dist_to_load, dist_to_flow, dist_to_either, target_load, target_flow
@@ -300,27 +306,146 @@ def compute_use_counts(slot_uses):
     return dict(use_count)
 
 
-def schedule(slots, slot_limits, allocator, tags=None):
-    """Schedule ops using list scheduling with integrated register allocation.
+@dataclass
+class AllocState:
+    """Mutable state for integrated scheduling + register allocation."""
+    allocator: ScratchAllocator
+    remaining_uses: dict  # VReg -> remaining use count
+    transferred_vregs: set  # vreg IDs whose address was reused by a def
 
-    Builds a DAG from VReg def-use chains and greedily packs independent
-    ops into cycles, respecting slot limits. Allocates physical addresses
-    inline — no separate allocation pass needed.
 
-    Returns (bundles, sched_meta) where bundles have physical addresses.
+def resolve_parent(vreg):
+    """If vreg is a sub-element of a vector, return the parent; otherwise return vreg."""
+    if hasattr(vreg, 'parent') and vreg.parent is not None:
+        return vreg.parent
+    return vreg
+
+
+def op_desc(i, slots):
+    """Human-readable description of slot i."""
+    engine, args = slots[i]
+    op_name = args[0] if args else ""
+    dest = ""
+    if len(args) > 1 and isinstance(args[1], VReg):
+        dest = args[1].name_hint or f"v{args[1].id}"
+    return f"{engine} {op_name} {dest}".strip()
+
+
+def named_args(i, slots):
+    """Human-readable argument list for slot i."""
+    engine, args = slots[i]
+    parts = [a.name_hint or f"v{a.id}" if isinstance(a, VReg) else a for a in args]
+    return f"({engine} {' '.join(str(x) for x in parts)})"
+
+
+def alloc_sort_key(i, slot_defs, slot_uses, alloc_state):
+    """Prefer scheduling ops that free space over ops that consume space.
+
+    Returns (added - freed) where freed = scratch words released by
+    last-use inputs, added = scratch words needed for new outputs.
     """
-    n = len(slots)
-    if n == 0:
-        return [], []
+    freed = sum(resolve_parent(v).size for v in slot_uses[i]
+                if isinstance(resolve_parent(v), VReg)
+                and resolve_parent(v).pinned_addr is None
+                and alloc_state.remaining_uses.get(resolve_parent(v), 0) == 1)
+    added = sum(v.size for v in slot_defs[i]
+                if isinstance(v, VReg) and v.pinned_addr is None
+                and alloc_state.allocator.get_addr(v) is None)
+    return added - freed
 
-    slot_defs, slot_uses, successors, predecessors, in_degree = build_dag(slots)
-    dist_to_load, dist_to_flow, dist_to_either, target_load, target_flow = compute_distances(slots, predecessors)
-    remaining_uses = compute_use_counts(slot_uses)
 
-    # === Active set management ===
-    MAX_ACTIVE = 32
+def try_alloc_defs(i, slot_defs, alloc_state):
+    """Try to allocate scratch for all defs of op i. Rolls back on failure."""
+    allocated = []
+    for vreg in slot_defs[i]:
+        if isinstance(vreg, VReg) and vreg.pinned_addr is None:
+            addr = alloc_state.allocator.try_allocate(vreg)
+            if addr is None:
+                for v in allocated:
+                    alloc_state.allocator.rollback(v)
+                return False
+            allocated.append(vreg)
+    return True
 
-    # Extract per-op vector/round info from tags
+
+def try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
+    """Try to allocate defs. If that fails, free last-use inputs and retry.
+
+    On success, may add vreg IDs to alloc_state.transferred_vregs when
+    an input's scratch space is reused by an output.
+    """
+    if try_alloc_defs(i, slot_defs, alloc_state):
+        return True
+
+    pre_freed = []
+    for v in slot_uses[i]:
+        pv = resolve_parent(v)
+        if (isinstance(pv, VReg) and pv.pinned_addr is None
+                and alloc_state.remaining_uses.get(pv, 0) == 1):
+            addr = alloc_state.allocator.get_addr(pv)
+            if addr is not None:
+                pre_freed.append((pv, addr))
+                for j in range(pv.size):
+                    alloc_state.allocator.occupied[addr + j] = False
+
+    if not pre_freed:
+        return False
+
+    if try_alloc_defs(i, slot_defs, alloc_state):
+        for pv, _ in pre_freed:
+            alloc_state.transferred_vregs.add(pv.id)
+        return True
+
+    for pv, addr in pre_freed:
+        for j in range(pv.size):
+            alloc_state.allocator.occupied[addr + j] = True
+    return False
+
+
+def consume_uses(i, slot_uses, alloc_state):
+    """Decrement use counts for op i's inputs. Returns vregs ready to free.
+
+    Handles transferred_vregs: if an input's address was reused by a def
+    (via try_alloc_or_reuse), removes the mapping without freeing the space.
+    """
+    frees = []
+    for v in slot_uses[i]:
+        pv = resolve_parent(v)
+        if isinstance(pv, VReg) and pv.pinned_addr is None:
+            alloc_state.remaining_uses[pv] = alloc_state.remaining_uses.get(pv, 0) - 1
+            if alloc_state.remaining_uses[pv] == 0:
+                if pv.id in alloc_state.transferred_vregs:
+                    if pv in alloc_state.allocator.vreg_to_addr:
+                        del alloc_state.allocator.vreg_to_addr[pv]
+                    alloc_state.transferred_vregs.discard(pv.id)
+                else:
+                    frees.append(pv)
+    return frees
+
+
+@dataclass
+class VectorState:
+    """Per-vector/round metadata and mutable tracking state for scheduling."""
+    op_vi: list          # op index -> vector index (-1 if none)
+    op_rnd: list         # op index -> round index (-1 if none)
+    vi_rounds: dict      # vi -> set of round indices
+    all_vectors: list    # sorted vector indices
+    has_vectors: bool
+    round_yield_type: dict  # (vi, rnd) -> "load"|"flow"|"free"
+    rnd_turnaround: dict    # (vi, rnd) -> estimated serial cycles
+    total_ops_per_vi_rnd: dict  # (vi, rnd) -> total op count
+    max_active: int
+    # Mutable scheduling state
+    active_set: set
+    inactive_queue: list
+    scheduled_per_vi_rnd: dict
+    vi_rnd_start_cycle: dict
+    vector_current_round: dict
+    vector_priority: dict
+
+
+def build_vector_state(slots, tags, n, max_active=32):
+    """Parse per-op vector/round tags and initialize vector scheduling state."""
     op_vi = [-1] * n
     op_rnd = [-1] * n
     ops_per_vi_rnd = defaultdict(list)
@@ -341,10 +466,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
     all_vectors = sorted(vi_rounds.keys())
     has_vectors = len(all_vectors) > 0
 
-    # Yield type: what bottleneck resource does each (vi, rnd) consume?
     round_yield_type = {}
     for (vi, rnd), op_indices in ops_per_vi_rnd.items():
-        if rnd < 0:  # setup ops (initial loads)
+        if rnd < 0:
             round_yield_type[(vi, rnd)] = "free"
             continue
         has_gather = any(slots[i][0] == "load" and slots[i][1][0] == "load_offset"
@@ -358,8 +482,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
         else:
             round_yield_type[(vi, rnd)] = "free"
 
-    # Turnaround cost: serial cycles before this round unlocks VALU work
-    # flow ops block 1-per-cycle, loads block at 2-per-cycle
     rnd_turnaround = {}
     for (vi, rnd), op_indices in ops_per_vi_rnd.items():
         if rnd < 0:
@@ -369,120 +491,116 @@ def schedule(slots, slot_limits, allocator, tags=None):
         n_load = sum(1 for i in op_indices if slots[i][0] == "load")
         rnd_turnaround[(vi, rnd)] = n_flow + (n_load + 1) // 2
 
-    # Active set: first MAX_ACTIVE vectors
     if has_vectors:
-        active_set = set(all_vectors[:MAX_ACTIVE])
-        inactive_queue = list(all_vectors[MAX_ACTIVE:])
+        active_set = set(all_vectors[:max_active])
+        inactive_queue = list(all_vectors[max_active:])
     else:
         active_set = set()
         inactive_queue = []
 
-    # Per-vector round tracking
     total_ops_per_vi_rnd = {k: len(v) for k, v in ops_per_vi_rnd.items()}
-    scheduled_per_vi_rnd = defaultdict(int)
-    vi_rnd_start_cycle = {}  # (vi, rnd) -> cycle when first op scheduled
     vector_current_round = {}
     for vi in all_vectors:
         vector_current_round[vi] = min(vi_rounds[vi])
 
-    vector_priority = {}  # vi -> priority (0=boost, 1=normal)
+    return VectorState(
+        op_vi=op_vi, op_rnd=op_rnd,
+        vi_rounds=dict(vi_rounds),
+        all_vectors=all_vectors, has_vectors=has_vectors,
+        round_yield_type=round_yield_type,
+        rnd_turnaround=rnd_turnaround,
+        total_ops_per_vi_rnd=total_ops_per_vi_rnd,
+        max_active=max_active,
+        active_set=active_set, inactive_queue=inactive_queue,
+        scheduled_per_vi_rnd=defaultdict(int),
+        vi_rnd_start_cycle={},
+        vector_current_round=vector_current_round,
+        vector_priority={},
+    )
 
-    # --- Metadata helpers (for tracing) ---
 
-    def op_desc(i):
-        engine, args = slots[i]
-        op_name = args[0] if args else ""
-        dest = ""
-        if len(args) > 1 and isinstance(args[1], VReg):
-            dest = args[1].name_hint or f"v{args[1].id}"
-        return f"{engine} {op_name} {dest}".strip()
+def update_vector_rounds(scheduled_this_cycle, vec, cycle_num):
+    """Track per-vector round completion and advance vectors to next round."""
+    if not vec.has_vectors:
+        return
+    for i in scheduled_this_cycle:
+        vi_s = vec.op_vi[i]
+        rnd_s = vec.op_rnd[i]
+        if vi_s < 0:
+            continue
+        key = (vi_s, rnd_s)
+        if key not in vec.total_ops_per_vi_rnd:
+            continue
+        if key not in vec.vi_rnd_start_cycle:
+            vec.vi_rnd_start_cycle[key] = cycle_num
+        vec.scheduled_per_vi_rnd[key] += 1
+        if vec.scheduled_per_vi_rnd[key] >= vec.total_ops_per_vi_rnd[key]:
+            start_c = vec.vi_rnd_start_cycle.get(key, -1)
+            print(f"  (vi={vi_s}, rnd={rnd_s}) done cycle={cycle_num} (started={start_c}, dur={cycle_num - start_c})")
+            next_rounds = sorted(
+                r for r in vec.vi_rounds[vi_s]
+                if vec.scheduled_per_vi_rnd[(vi_s, r)] < vec.total_ops_per_vi_rnd.get((vi_s, r), 0)
+            )
+            vec.active_set.discard(vi_s)
+            if next_rounds:
+                vec.vector_current_round[vi_s] = next_rounds[0]
 
-    def named_args(i):
-        engine, args = slots[i]
-        parts = [a.name_hint or f"v{a.id}" if isinstance(a, VReg) else a for a in args]
-        return f"({engine} {' '.join(str(x) for x in parts)})"
 
-    # --- Allocation helpers ---
+def raise_deadlock(ready, slots, cycle_num, vec, available, slot_defs,
+                   slot_uses, allocator, alloc_state, active_metric):
+    """Print detailed diagnostics and raise RuntimeError on scheduler deadlock."""
+    gated = [i for i in ready if vec.op_vi[i] >= 0 and vec.op_vi[i] not in vec.active_set]
+    not_gated = [i for i in ready if not (vec.op_vi[i] >= 0 and vec.op_vi[i] not in vec.active_set)]
+    engines = Counter(slots[i][0] for i in ready)
+    print(f"  DEADLOCK cycle={cycle_num}: {len(ready)} ready, {len(gated)} gated, {len(not_gated)} not gated")
+    print(f"  Engines: {dict(engines)}, Scratch: {allocator.current_usage()}/{allocator.scratch_size}")
+    print(f"  Active metric: {active_metric}")
+    print(f"  Active set ({len(vec.active_set)}): {sorted(vec.active_set)}")
+    reasons = Counter()
+    for i in not_gated:
+        eng = slots[i][0]
+        can_native = available.get(eng, 0) > 0
+        can_promo = (eng == "valu" and slots[i][1][0] not in ("vbroadcast", "multiply_add") and available.get("alu", 0) > 0)
+        if not can_native and not can_promo:
+            reasons["no_slot"] += 1
+        else:
+            reasons["alloc_fail"] += 1
+    print(f"  Failure reasons: {dict(reasons)}")
+    rnd_counts = Counter(vec.op_rnd[i] for i in not_gated)
+    print(f"  Rounds of stuck ops: {dict(sorted(rnd_counts.items()))}")
+    vi_counts = Counter(vec.op_vi[i] for i in not_gated)
+    print(f"  Vectors of stuck ops: {dict(sorted(vi_counts.items()))}")
+    for i in not_gated[:15]:
+        defs = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
+        uses = [(resolve_parent(v).name_hint, alloc_state.remaining_uses.get(resolve_parent(v), 0)) for v in slot_uses[i] if isinstance(resolve_parent(v), VReg) and resolve_parent(v).pinned_addr is None]
+        print(f"    op {i}: {op_desc(i, slots)} vi={vec.op_vi[i]} rnd={vec.op_rnd[i]} engine={slots[i][0]} defs={defs} uses_remaining={uses}")
+    raise RuntimeError(
+        f"Scheduler deadlock: {len(ready)} ready ops but none schedulable."
+    )
 
-    def resolve_parent(vreg):
-        if hasattr(vreg, 'parent') and vreg.parent is not None:
-            return vreg.parent
-        return vreg
 
-    def sort_key(i):
-        """Prefer ops that free space over ops that consume space."""
-        freed = sum(resolve_parent(v).size for v in slot_uses[i]
-                    if isinstance(resolve_parent(v), VReg)
-                    and resolve_parent(v).pinned_addr is None
-                    and remaining_uses.get(resolve_parent(v), 0) == 1)
-        added = sum(v.size for v in slot_defs[i]
-                    if isinstance(v, VReg) and v.pinned_addr is None
-                    and allocator.get_addr(v) is None)
-        return added - freed
+def schedule(slots, slot_limits, allocator, tags=None):
+    """Schedule ops using list scheduling with integrated register allocation.
 
-    def try_alloc_defs(i):
-        """Try to allocate all defs for op i. Returns True or rolls back."""
-        allocated = []
-        for vreg in slot_defs[i]:
-            if isinstance(vreg, VReg) and vreg.pinned_addr is None:
-                addr = allocator.try_allocate(vreg)
-                if addr is None:
-                    for v in allocated:
-                        allocator.rollback(v)
-                    return False
-                allocated.append(vreg)
-        return True
+    Builds a DAG from VReg def-use chains and greedily packs independent
+    ops into cycles, respecting slot limits. Allocates physical addresses
+    inline — no separate allocation pass needed.
 
-    transferred_vregs = set()  # vregs whose address was reused by a def
+    Returns (bundles, sched_meta) where bundles have physical addresses.
+    """
+    n = len(slots)
+    if n == 0:
+        return [], []
 
-    def try_alloc_or_reuse(i):
-        """Try to allocate defs. If that fails, free last-use inputs and retry."""
-        if try_alloc_defs(i):
-            return True
+    slot_defs, slot_uses, successors, predecessors, in_degree = build_dag(slots)
+    dist_to_load, dist_to_flow, dist_to_either, target_load, target_flow = compute_distances(slots, predecessors)
+    alloc_state = AllocState(
+        allocator=allocator,
+        remaining_uses=compute_use_counts(slot_uses),
+        transferred_vregs=set(),
+    )
 
-        # Tentatively free last-use inputs to make space
-        pre_freed = []
-        for v in slot_uses[i]:
-            pv = resolve_parent(v)
-            if (isinstance(pv, VReg) and pv.pinned_addr is None
-                    and remaining_uses.get(pv, 0) == 1):
-                addr = allocator.get_addr(pv)
-                if addr is not None:
-                    pre_freed.append((pv, addr))
-                    for j in range(pv.size):
-                        allocator.occupied[addr + j] = False
-
-        if not pre_freed:
-            return False
-
-        if try_alloc_defs(i):
-            # Mark pre-freed vregs so consume_uses won't double-clear
-            for pv, _ in pre_freed:
-                transferred_vregs.add(pv.id)
-            return True
-
-        # Rollback: restore occupied bits
-        for pv, addr in pre_freed:
-            for j in range(pv.size):
-                allocator.occupied[addr + j] = True
-        return False
-
-    def consume_uses(i):
-        """Decrement use counts, return vregs ready to free."""
-        frees = []
-        for v in slot_uses[i]:
-            pv = resolve_parent(v)
-            if isinstance(pv, VReg) and pv.pinned_addr is None:
-                remaining_uses[pv] = remaining_uses.get(pv, 0) - 1
-                if remaining_uses[pv] == 0:
-                    if pv.id in transferred_vregs:
-                        # Address reused by a def — remove mapping, keep occupied
-                        if pv in allocator.vreg_to_addr:
-                            del allocator.vreg_to_addr[pv]
-                        transferred_vregs.discard(pv.id)
-                    else:
-                        frees.append(pv)
-        return frees
+    vec = build_vector_state(slots, tags, n)
 
     # --- Scheduling state ---
 
@@ -512,8 +630,8 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 remaining_to_load.get(target_load[i], n),
                 remaining_to_flow.get(target_flow[i], n),
             )
-        rnd = op_rnd[i] if active_metric == "load" else 0
-        return (r, d, sort_key(i), i)
+        rnd = vec.op_rnd[i] if active_metric == "load" else 0
+        return (r, d, alloc_sort_key(i, slot_defs, slot_uses, alloc_state), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
     bundles = []
@@ -539,10 +657,10 @@ def schedule(slots, slot_limits, allocator, tags=None):
     def build_meta(i):
         meta = {
             "ready": ready_cycle.get(i, 0), "sched": cycle_num,
-            "op_id": assign_op_id(i), "named": named_args(i),
-            "pressure": sort_key(i),
+            "op_id": assign_op_id(i), "named": named_args(i, slots),
+            "pressure": alloc_sort_key(i, slot_defs, slot_uses, alloc_state),
             "dist_to_load": dist_to_load[i], "dist_to_flow": dist_to_flow[i],
-            "deps": [{"op": op_desc(p), "cycle": op_scheduled_cycle.get(p, -1),
+            "deps": [{"op": op_desc(p, slots), "cycle": op_scheduled_cycle.get(p, -1),
                        "op_id": assign_op_id(p)} for p in predecessors[i]],
         }
         if tags is not None and i < len(tags):
@@ -564,7 +682,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
             """Update dynamic metrics and bookkeeping when op i completes."""
             scheduled_this_cycle.append(i)
             op_scheduled_cycle[i] = cycle_num
-            pending_frees.extend(consume_uses(i))
+            pending_frees.extend(consume_uses(i, slot_uses, alloc_state))
             if target_load[i] >= 0:
                 remaining_to_load[target_load[i]] -= 1
             if target_flow[i] >= 0:
@@ -577,20 +695,20 @@ def schedule(slots, slot_limits, allocator, tags=None):
             mark_scheduled(i)
 
         # Re-admit vectors to active set based on scheduling priority
-        if has_vectors and len(active_set) < MAX_ACTIVE:
+        if vec.has_vectors and len(vec.active_set) < vec.max_active:
             # Find inactive vectors that have gated ready ops
             candidate_vis = {}
             for i in ready:
-                vi_i = op_vi[i]
-                if vi_i >= 0 and vi_i not in active_set:
+                vi_i = vec.op_vi[i]
+                if vi_i >= 0 and vi_i not in vec.active_set:
                     if vi_i not in candidate_vis or sched_key(i) < candidate_vis[vi_i]:
                         candidate_vis[vi_i] = sched_key(i)
-            # Admit best candidates up to MAX_ACTIVE
+            # Admit best candidates up to max_active
             if candidate_vis:
                 ranked = sorted(candidate_vis.keys(), key=lambda vi: candidate_vis[vi])
-                slots_avail = MAX_ACTIVE - len(active_set)
+                slots_avail = vec.max_active - len(vec.active_set)
                 for vi in ranked[:slots_avail]:
-                    active_set.add(vi)
+                    vec.active_set.add(vi)
 
         # Continue in-progress partial valu→alu promotions
         for i in list(partial_ops):
@@ -609,23 +727,23 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 mark_scheduled(i)
 
         # Compute vector priorities based on turnaround cost to VALU work
-        if has_vectors:
+        if vec.has_vectors:
             n_ready_valu = sum(1 for i in ready if slots[i][0] == "valu")
             alu_pressure = n_ready_valu > slot_limits.get("valu", 6)
 
-            vector_priority.clear()
+            vec.vector_priority.clear()
             if alu_pressure:
                 # ALU promotion under pressure — boost vectors with lowest
                 # turnaround to new VALU work (low-k rounds finish faster)
-                for vi in active_set:
-                    crnd = vector_current_round.get(vi)
+                for vi in vec.active_set:
+                    crnd = vec.vector_current_round.get(vi)
                     if crnd is None:
-                        vector_priority[vi] = 99
+                        vec.vector_priority[vi] = 99
                     else:
-                        vector_priority[vi] = rnd_turnaround.get((vi, crnd), 0)
+                        vec.vector_priority[vi] = vec.rnd_turnaround.get((vi, crnd), 0)
             else:
-                for vi in active_set:
-                    vector_priority[vi] = 0
+                for vi in vec.active_set:
+                    vec.vector_priority[vi] = 0
 
         # Adaptive starvation: bias remaining-preds metric toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
@@ -644,24 +762,14 @@ def schedule(slots, slot_limits, allocator, tags=None):
             engine = slots[i][0]
 
             # Active set gating: gate ALL ops for inactive vectors
-            vi_i = op_vi[i]
-            if vi_i >= 0 and vi_i not in active_set:
+            vi_i = vec.op_vi[i]
+            if vi_i >= 0 and vi_i not in vec.active_set:
                 remaining.append(i)
                 continue
 
             if engine == "flex_alu_add":
-                # flex_alu_add: scalar add emitted as alu, args trimmed to drop imm
-                if available.get("alu", 0) <= 0:
-                    # Defer — might promote to flow after main loop
-                    deferred_flex.append(i)
-                    continue
-                if not try_alloc_or_reuse(i):
-                    remaining.append(i)
-                    stall_alloc += 1
-                    continue
-                physical_args = allocator.rewrite_args(slots[i][1])
-                emit(("alu", physical_args[:4]), i)
-                available["alu"] -= 1
+                # Always defer — prefer flow over ALU to free ALU for vector promotions
+                deferred_flex.append(i)
                 continue
 
             # Check engine availability
@@ -691,7 +799,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     stall_slot += 1
                     continue
                 # After swap: schedule non-promotable op on the freed native VALU slot
-                if not try_alloc_or_reuse(i):
+                if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
                     remaining.append(i)
                     stall_alloc += 1
                     continue
@@ -700,12 +808,12 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 # available["valu"] stays the same: we freed one and used one
                 continue
 
-            if not try_alloc_or_reuse(i):
+            if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
                 remaining.append(i)
                 stall_alloc += 1
                 if stall_alloc <= 5:
                     defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
-                    print(f"  alloc_fail cycle={cycle_num} op={op_desc(i)} usage={allocator.current_usage()} defs={defs_info}")
+                    print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
                 continue
 
             if can_native:
@@ -726,19 +834,25 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 else:
                     partial_ops[i] = can_do
 
-        # Deferred flex_alu_add → flow promotion (add_imm)
+        # Deferred flex_alu_add: prefer flow (add_imm), fall back to ALU
         for i in deferred_flex:
             if available.get("flow", 0) > 0:
-                if not try_alloc_or_reuse(i):
+                if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
                     remaining.append(i)
                     stall_alloc += 1
                     continue
                 physical_args = allocator.rewrite_args(slots[i][1])
-                # flex_alu_add args: ("+", dest, src, offset_vreg, offset_imm)
-                # flow add_imm: ("add_imm", dest, src, imm)
-                imm = slots[i][1][4]  # grab imm before rewrite (it's a plain int)
+                imm = slots[i][1][4]
                 emit(("flow", ("add_imm", physical_args[1], physical_args[2], imm)), i)
                 available["flow"] -= 1
+            elif available.get("alu", 0) > 0:
+                if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
+                    remaining.append(i)
+                    stall_alloc += 1
+                    continue
+                physical_args = allocator.rewrite_args(slots[i][1])
+                emit(("alu", physical_args[:4]), i)
+                available["alu"] -= 1
             else:
                 remaining.append(i)
                 stall_slot += 1
@@ -757,30 +871,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     newly_ready.append(succ)
                     ready_cycle[succ] = cycle_num + 1
 
-        # Track per-vector round completion and active set transitions
-        if has_vectors:
-            for i in scheduled_this_cycle:
-                vi_s = op_vi[i]
-                rnd_s = op_rnd[i]
-                if vi_s < 0:
-                    continue
-                key = (vi_s, rnd_s)
-                if key in total_ops_per_vi_rnd:
-                    if key not in vi_rnd_start_cycle:
-                        vi_rnd_start_cycle[key] = cycle_num
-                    scheduled_per_vi_rnd[key] += 1
-                    if scheduled_per_vi_rnd[key] >= total_ops_per_vi_rnd[key]:
-                        start_c = vi_rnd_start_cycle.get(key, -1)
-                        print(f"  (vi={vi_s}, rnd={rnd_s}) done cycle={cycle_num} (started={start_c}, dur={cycle_num - start_c})")
-                        # (vi, rnd) complete — advance vector to next round
-                        next_rounds = sorted(
-                            r for r in vi_rounds[vi_s]
-                            if scheduled_per_vi_rnd[(vi_s, r)] < total_ops_per_vi_rnd.get((vi_s, r), 0)
-                        )
-                        # Round complete — remove from active set
-                        active_set.discard(vi_s)
-                        if next_rounds:
-                            vector_current_round[vi_s] = next_rounds[0]
+        update_vector_rounds(scheduled_this_cycle, vec, cycle_num)
 
         ready = sorted(remaining + newly_ready, key=sched_key)
         if bundle:
@@ -789,43 +880,15 @@ def schedule(slots, slot_limits, allocator, tags=None):
             cycle_num += 1
         elif not partial_ops:
             if ready:
-                gated = [i for i in ready if op_vi[i] >= 0 and op_vi[i] not in active_set]
-                not_gated = [i for i in ready if not (op_vi[i] >= 0 and op_vi[i] not in active_set)]
-                engines = Counter(slots[i][0] for i in ready)
-                print(f"  DEADLOCK cycle={cycle_num}: {len(ready)} ready, {len(gated)} gated, {len(not_gated)} not gated")
-                print(f"  Engines: {dict(engines)}, Scratch: {allocator.current_usage()}/{allocator.scratch_size}")
-                print(f"  Active metric: {active_metric}")
-                print(f"  Active set ({len(active_set)}): {sorted(active_set)}")
-                # Classify why each not-gated op failed
-                reasons = Counter()
-                for i in not_gated:
-                    eng = slots[i][0]
-                    can_native = available.get(eng, 0) > 0
-                    can_promo = (eng == "valu" and slots[i][1][0] not in ("vbroadcast", "multiply_add") and available.get("alu", 0) > 0)
-                    if not can_native and not can_promo:
-                        reasons["no_slot"] += 1
-                    else:
-                        reasons["alloc_fail"] += 1
-                print(f"  Failure reasons: {dict(reasons)}")
-                # Show rounds of not-gated ops
-                rnd_counts = Counter(op_rnd[i] for i in not_gated)
-                print(f"  Rounds of stuck ops: {dict(sorted(rnd_counts.items()))}")
-                vi_counts = Counter(op_vi[i] for i in not_gated)
-                print(f"  Vectors of stuck ops: {dict(sorted(vi_counts.items()))}")
-                # Show sample ops with allocation details
-                for i in not_gated[:15]:
-                    defs = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
-                    uses = [(resolve_parent(v).name_hint, remaining_uses.get(resolve_parent(v), 0)) for v in slot_uses[i] if isinstance(resolve_parent(v), VReg) and resolve_parent(v).pinned_addr is None]
-                    print(f"    op {i}: {op_desc(i)} vi={op_vi[i]} rnd={op_rnd[i]} engine={slots[i][0]} defs={defs} uses_remaining={uses}")
-                raise RuntimeError(
-                    f"Scheduler deadlock: {len(ready)} ready ops but none schedulable."
-                )
+                raise_deadlock(ready, slots, cycle_num, vec, available,
+                               slot_defs, slot_uses, allocator, alloc_state,
+                               active_metric)
             break
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
-    if has_vectors:
-        print(f"  Active set: max={MAX_ACTIVE}")
-        print(f"  Vectors: {len(all_vectors)} total, {len(inactive_queue)} remaining inactive")
+    if vec.has_vectors:
+        print(f"  Active set: max={vec.max_active}")
+        print(f"  Vectors: {len(vec.all_vectors)} total, {len(vec.inactive_queue)} remaining inactive")
     return bundles, sched_meta
 
 
@@ -1373,20 +1436,21 @@ class KernelBuilder:
         """
         slots = []
         n_nodes = 2 ** k
-
-        level_offset_imm = 2**k - 1
-        level_offset = self.scratch_const(level_offset_imm)
-        level_base = self.new_vreg(f"level{k}_base")
-        slots.append(("flex_alu_add", ("+", level_base, forest_values_p_addr, level_offset, level_offset_imm)))
         vregs = []
 
-        for i in range(max(n_nodes//8, 1)):
-            current_offset = self.new_vreg(f"level{k}_offset_{i}")
-            offset_imm = i * VLEN
-            offset_constant = self.scratch_const(offset_imm)
-            slots.append(("flex_alu_add", ("+", current_offset, level_base, offset_constant, offset_imm)))
-            vnode_vreg = self.new_vreg_vec(f"level{k}_offset_node_{i}")
-            slots.append(("load", ("vload", vnode_vreg, current_offset)))
+        n_chunks = max(n_nodes // 8, 1)
+        for i in range(n_chunks):
+            offset_imm = (2**k - 1) + i * VLEN
+            if offset_imm == 0:
+                # k=0: vload directly from forest_values_p, no add needed
+                vnode_vreg = self.new_vreg_vec(f"level{k}_offset_node_{i}")
+                slots.append(("load", ("vload", vnode_vreg, forest_values_p_addr)))
+            else:
+                offset_constant = self.scratch_const(offset_imm)
+                chunk_addr = self.new_vreg(f"level{k}_addr_{i}")
+                slots.append(("flex_alu_add", ("+", chunk_addr, forest_values_p_addr, offset_constant, offset_imm)))
+                vnode_vreg = self.new_vreg_vec(f"level{k}_offset_node_{i}")
+                slots.append(("load", ("vload", vnode_vreg, chunk_addr)))
             vregs.append(vnode_vreg)
 
         broadcast_vregs = []
@@ -1565,9 +1629,12 @@ class KernelBuilder:
         val_vecs = []
         for vi in range(n_vectors):
             offset_imm = vi * VLEN
-            offset_const = self.scratch_const(offset_imm)
-            val_base = self.new_vreg(f"val_base_init_v{vi}")
-            emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
+            if offset_imm == 0:
+                val_base = param_vregs["inp_values_p"]
+            else:
+                offset_const = self.scratch_const(offset_imm)
+                val_base = self.new_vreg(f"val_base_init_v{vi}")
+                emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
 
             val_v = self.new_vreg_vec(f"val_init_v{vi}")
             emit(("load", ("vload", val_v, val_base)), vi=vi, rnd=-1)
@@ -1641,9 +1708,12 @@ class KernelBuilder:
         # Store final values back to memory (indices not checked by submission test)
         for vi in range(n_vectors):
             offset_imm = vi * VLEN
-            offset_const = self.scratch_const(offset_imm)
-            val_base = self.new_vreg(f"val_base_final_v{vi}")
-            emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
+            if offset_imm == 0:
+                val_base = param_vregs["inp_values_p"]
+            else:
+                offset_const = self.scratch_const(offset_imm)
+                val_base = self.new_vreg(f"val_base_final_v{vi}")
+                emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
             emit(("store", ("vstore", val_base, val_vecs[vi])), vi=vi, rnd=rounds)
 
         # Prepend all setup loads to body for scheduling
