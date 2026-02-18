@@ -315,8 +315,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
 
     # === Active set management ===
     MAX_ACTIVE = 32
-    TARGET_GATHER = 3  # target vectors working toward gathers
-    TARGET_MUX = 2     # target vectors working toward mux/vselects
 
     # Extract per-op vector/round info from tags
     op_vi = [-1] * n
@@ -355,6 +353,17 @@ def schedule(slots, slot_limits, allocator, tags=None):
             round_yield_type[(vi, rnd)] = "flow"
         else:
             round_yield_type[(vi, rnd)] = "free"
+
+    # Turnaround cost: serial cycles before this round unlocks VALU work
+    # flow ops block 1-per-cycle, loads block at 2-per-cycle
+    rnd_turnaround = {}
+    for (vi, rnd), op_indices in ops_per_vi_rnd.items():
+        if rnd < 0:
+            rnd_turnaround[(vi, rnd)] = 0
+            continue
+        n_flow = sum(1 for i in op_indices if slots[i][0] == "flow")
+        n_load = sum(1 for i in op_indices if slots[i][0] == "load")
+        rnd_turnaround[(vi, rnd)] = n_flow + (n_load + 1) // 2
 
     # Active set: first MAX_ACTIVE vectors
     if has_vectors:
@@ -419,6 +428,40 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 allocated.append(vreg)
         return True
 
+    transferred_vregs = set()  # vregs whose address was reused by a def
+
+    def try_alloc_or_reuse(i):
+        """Try to allocate defs. If that fails, free last-use inputs and retry."""
+        if try_alloc_defs(i):
+            return True
+
+        # Tentatively free last-use inputs to make space
+        pre_freed = []
+        for v in slot_uses[i]:
+            pv = resolve_parent(v)
+            if (isinstance(pv, VReg) and pv.pinned_addr is None
+                    and remaining_uses.get(pv, 0) == 1):
+                addr = allocator.get_addr(pv)
+                if addr is not None:
+                    pre_freed.append((pv, addr))
+                    for j in range(pv.size):
+                        allocator.occupied[addr + j] = False
+
+        if not pre_freed:
+            return False
+
+        if try_alloc_defs(i):
+            # Mark pre-freed vregs so consume_uses won't double-clear
+            for pv, _ in pre_freed:
+                transferred_vregs.add(pv.id)
+            return True
+
+        # Rollback: restore occupied bits
+        for pv, addr in pre_freed:
+            for j in range(pv.size):
+                allocator.occupied[addr + j] = True
+        return False
+
     def consume_uses(i):
         """Decrement use counts, return vregs ready to free."""
         frees = []
@@ -427,7 +470,13 @@ def schedule(slots, slot_limits, allocator, tags=None):
             if isinstance(pv, VReg) and pv.pinned_addr is None:
                 remaining_uses[pv] = remaining_uses.get(pv, 0) - 1
                 if remaining_uses[pv] == 0:
-                    frees.append(pv)
+                    if pv.id in transferred_vregs:
+                        # Address reused by a def — remove mapping, keep occupied
+                        if pv in allocator.vreg_to_addr:
+                            del allocator.vreg_to_addr[pv]
+                        transferred_vregs.discard(pv.id)
+                    else:
+                        frees.append(pv)
         return frees
 
     # --- Scheduling state ---
@@ -437,7 +486,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
     def sched_key(i):
         vi = op_vi[i]
         vp = vector_priority.get(vi, 1) if vi >= 0 else 1
-        return (vp, active_dist[i], sort_key(i), i)
+        return (active_dist[i], sort_key(i), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
     bundles = []
@@ -491,6 +540,22 @@ def schedule(slots, slot_limits, allocator, tags=None):
             op_scheduled_cycle[i] = cycle_num
             pending_frees.extend(consume_uses(i))
 
+        # Re-admit vectors to active set based on scheduling priority
+        if has_vectors and len(active_set) < MAX_ACTIVE:
+            # Find inactive vectors that have gated ready ops
+            candidate_vis = {}
+            for i in ready:
+                vi_i = op_vi[i]
+                if vi_i >= 0 and vi_i not in active_set and slots[i][0] not in ("load", "flow", "store"):
+                    if vi_i not in candidate_vis or sched_key(i) < candidate_vis[vi_i]:
+                        candidate_vis[vi_i] = sched_key(i)
+            # Admit best candidates up to MAX_ACTIVE
+            if candidate_vis:
+                ranked = sorted(candidate_vis.keys(), key=lambda vi: candidate_vis[vi])
+                slots_avail = MAX_ACTIVE - len(active_set)
+                for vi in ranked[:slots_avail]:
+                    active_set.add(vi)
+
         # Continue in-progress partial valu→alu promotions
         for i in list(partial_ops):
             alu_avail = available.get("alu", 0)
@@ -509,35 +574,24 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 op_scheduled_cycle[i] = cycle_num
                 pending_frees.extend(consume_uses(i))
 
-        # Compute vector priorities based on composition target
+        # Compute vector priorities based on turnaround cost to VALU work
         if has_vectors:
-            n_toward_loads = 0
-            n_toward_flows = 0
-            for vi in active_set:
-                crnd = vector_current_round.get(vi)
-                if crnd is None:
-                    continue
-                yt = round_yield_type.get((vi, crnd), "free")
-                if yt == "load":
-                    n_toward_loads += 1
-                elif yt == "flow":
-                    n_toward_flows += 1
+            n_ready_valu = sum(1 for i in ready if slots[i][0] == "valu")
+            alu_pressure = n_ready_valu > slot_limits.get("valu", 6)
 
             vector_priority.clear()
-            load_deficit = TARGET_GATHER - n_toward_loads
-            flow_deficit = TARGET_MUX - n_toward_flows
-            for vi in active_set:
-                crnd = vector_current_round.get(vi)
-                if crnd is None:
-                    vector_priority[vi] = 1
-                    continue
-                yt = round_yield_type.get((vi, crnd), "free")
-                if yt == "load" and load_deficit > 0:
-                    vector_priority[vi] = 0  # urgently needed
-                elif yt == "flow" and flow_deficit > 0:
+            if alu_pressure:
+                # ALU promotion under pressure — boost vectors with lowest
+                # turnaround to new VALU work (low-k rounds finish faster)
+                for vi in active_set:
+                    crnd = vector_current_round.get(vi)
+                    if crnd is None:
+                        vector_priority[vi] = 99
+                    else:
+                        vector_priority[vi] = rnd_turnaround.get((vi, crnd), 0)
+            else:
+                for vi in active_set:
                     vector_priority[vi] = 0
-                else:
-                    vector_priority[vi] = 1  # normal
 
         # Original adaptive heuristic: bias toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
@@ -555,13 +609,13 @@ def schedule(slots, slot_limits, allocator, tags=None):
 
         # Schedule ready ops
         for i in ready:
-            # Active set gating: skip ops for inactive vectors
+            engine = slots[i][0]
+
+            # Active set gating: only gate compute ops (valu/alu), not load/flow
             vi_i = op_vi[i]
-            if vi_i >= 0 and vi_i not in active_set:
+            if vi_i >= 0 and vi_i not in active_set and engine not in ("load", "flow", "store"):
                 remaining.append(i)
                 continue
-
-            engine = slots[i][0]
 
             if engine == "flex_alu_add":
                 # flex_alu_add: scalar add emitted as alu, args trimmed to drop imm
@@ -569,7 +623,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     remaining.append(i)
                     stall_slot += 1
                     continue
-                if not try_alloc_defs(i):
+                if not try_alloc_or_reuse(i):
                     remaining.append(i)
                     stall_alloc += 1
                     continue
@@ -589,7 +643,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 stall_slot += 1
                 continue
 
-            if not try_alloc_defs(i):
+            if not try_alloc_or_reuse(i):
                 remaining.append(i)
                 stall_alloc += 1
                 if stall_alloc <= 5:
@@ -646,14 +700,10 @@ def schedule(slots, slot_limits, allocator, tags=None):
                             r for r in vi_rounds[vi_s]
                             if scheduled_per_vi_rnd[(vi_s, r)] < total_ops_per_vi_rnd.get((vi_s, r), 0)
                         )
+                        # Round complete — remove from active set
+                        active_set.discard(vi_s)
                         if next_rounds:
                             vector_current_round[vi_s] = next_rounds[0]
-                        else:
-                            # Vector fully complete — swap in next inactive vector
-                            active_set.discard(vi_s)
-                            if inactive_queue:
-                                new_vi = inactive_queue.pop(0)
-                                active_set.add(new_vi)
 
         ready = sorted(remaining + newly_ready, key=sched_key)
         if bundle:
@@ -662,6 +712,15 @@ def schedule(slots, slot_limits, allocator, tags=None):
             cycle_num += 1
         elif not partial_ops:
             if ready:
+                gated = [i for i in ready if op_vi[i] >= 0 and op_vi[i] not in active_set and slots[i][0] not in ("load", "flow", "store")]
+                not_gated = [i for i in ready if not (op_vi[i] >= 0 and op_vi[i] not in active_set and slots[i][0] not in ("load", "flow", "store"))]
+                engines = Counter(slots[i][0] for i in ready)
+                print(f"  DEADLOCK cycle={cycle_num}: {len(ready)} ready, {len(gated)} gated, {len(not_gated)} not gated")
+                print(f"  Engines: {dict(engines)}, Scratch: {allocator.current_usage()}/{allocator.scratch_size}")
+                print(f"  Active set ({len(active_set)}): {sorted(active_set)}")
+                for i in not_gated[:10]:
+                    defs = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg)]
+                    print(f"    op {i}: {op_desc(i)} vi={op_vi[i]} rnd={op_rnd[i]} engine={slots[i][0]} defs={defs}")
                 raise RuntimeError(
                     f"Scheduler deadlock: {len(ready)} ready ops but none schedulable."
                 )
@@ -669,7 +728,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
     if has_vectors:
-        print(f"  Active set: max={MAX_ACTIVE}, target_gather={TARGET_GATHER}, target_mux={TARGET_MUX}")
+        print(f"  Active set: max={MAX_ACTIVE}")
         print(f"  Vectors: {len(all_vectors)} total, {len(inactive_queue)} remaining inactive")
     return bundles, sched_meta
 
@@ -851,6 +910,8 @@ class KernelBuilder:
         df = self.print_timing_summary()
         if df is None:
             return
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -883,6 +944,39 @@ class KernelBuilder:
         plt.savefig("timing_analysis.png", dpi=150)
         plt.show()
         print("Saved timing_analysis.png")
+
+        # === Per-round timeline: one subplot per round, vi on y-axis ===
+        rounds = sorted(df["rnd"].unique())
+        n_rounds = len(rounds)
+        ncols = 4
+        nrows = (n_rounds + ncols - 1) // ncols
+        fig2, axes2 = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3 * nrows),
+                                    sharex=True, sharey=True)
+        axes2 = axes2.flatten() if n_rounds > 1 else [axes2]
+        global_start = df["start"].min()
+        global_end = df["end"].max()
+        cmap = plt.cm.tab10
+        for idx, rnd in enumerate(rounds):
+            ax = axes2[idx]
+            rnd_df = df[df["rnd"] == rnd].sort_values("vi")
+            for _, row in rnd_df.iterrows():
+                ax.barh(row["vi"], row["duration"], left=row["start"],
+                        color=cmap(rnd % 10), edgecolor="black", linewidth=0.5,
+                        height=0.8)
+            ax.set_title(f"Round {rnd}")
+            ax.set_xlim(global_start, global_end)
+            if idx % ncols == 0:
+                ax.set_ylabel("vi")
+            if idx >= (nrows - 1) * ncols:
+                ax.set_xlabel("Cycle")
+        # Hide unused subplots
+        for idx in range(n_rounds, len(axes2)):
+            axes2[idx].set_visible(False)
+        fig2.suptitle("Per-round timeline: start→end per vector", fontsize=14)
+        fig2.tight_layout()
+        fig2.savefig("per_round_timeline.png", dpi=150)
+        plt.show()
+        print("Saved per_round_timeline.png")
 
     def debug_info(self):
         return DebugInfo(
@@ -1217,7 +1311,7 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
-            if k <= 4:
+            if k <= 3:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -1234,7 +1328,7 @@ class KernelBuilder:
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 4 and vi < mux_count[k]:
+                if k <= 3 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=rnd)
 
@@ -1257,6 +1351,14 @@ class KernelBuilder:
                 if k == forest_height:
                     # At leaves: idx always wraps to 0, skip entire idx computation
                     new_idx_vecs.append(zero_vec)
+                elif idx_loaded is zero_vec:
+                    # idx was reset to 0 (came from leaf): 2*0+1+parity = 1+parity
+                    parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
+                    idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
+
+                    emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
+                    emit(("valu", ("+", idx_next, one_vec, parity)), vi=vi, rnd=rnd)
+                    new_idx_vecs.append(idx_next)
                 else:
                     # idx = 2*idx + 1 + (val & 1)
                     parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
@@ -1370,8 +1472,12 @@ def do_kernel_test(
         try:
             kb.print_timing_summary()
             kb.plot_timing()
-        except ImportError:
-            pass
+        except ImportError as e:
+            print(f"Plot import error: {e}")
+        except Exception as e:
+            print(f"Plot error: {e}")
+            import traceback
+            traceback.print_exc()
 
     return machine.cycle
 
