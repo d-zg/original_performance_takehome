@@ -628,14 +628,12 @@ def schedule(slots, slot_limits, allocator, tags=None):
         # Adaptive starvation: bias remaining-preds metric toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
-        load_starved = n_ready_loads < slot_limits.get("load", 2)
-        flow_starved = n_ready_flows < slot_limits.get("flow", 1)
-        if load_starved and not flow_starved:
-            active_metric = "load"
-        elif flow_starved and not load_starved:
+        load_starved = n_ready_loads < 24
+        flow_starved = n_ready_flows < slot_limits.get("flow", 1) 
+        if flow_starved:
             active_metric = "flow"
         else:
-            active_metric = "either"
+            active_metric = "load"
 
         ready.sort(key=sched_key)
 
@@ -1198,9 +1196,9 @@ class KernelBuilder:
         # Subtract kept: removing it saves ops but hurts scheduling (fewer deps = more
         # scratch pressure). With subtract: 1231 cycles, without: 1266 cycles.
         _level_start_1based = {2: "four_vec", 3: "eight_vec", 4: "sixteen_vec"}
-        adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx_vec{index}")
-        slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(_level_start_1based[k], VLEN))))
-        bit_source = adjusted_idx
+        # adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx_vec{index}") neither of these are needed, due to schedule quirks somehow works better
+        # slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(_level_start_1based[k], VLEN))))
+        bit_source = idx_vreg
 
         for stage in range(k):
             shift_slots, condition_vreg = extract_bit(bit_source, stage, stage, index)
@@ -1292,7 +1290,7 @@ class KernelBuilder:
         two_vec = self.pinned_vreg("two_vec", VLEN)
         four_vec = self.pinned_vreg("four_vec", VLEN)
         eight_vec = self.pinned_vreg("eight_vec", VLEN)
-        sixteen_vec = self.pinned_vreg("sixteen_vec", VLEN)
+        # sixteen_vec = self.pinned_vreg("sixteen_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
         emit(("valu", ("vbroadcast", zero_vec, zero_const)))
@@ -1300,7 +1298,7 @@ class KernelBuilder:
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", four_vec, self.scratch_const(4))))
         emit(("valu", ("vbroadcast", eight_vec, self.scratch_const(8))))
-        emit(("valu", ("vbroadcast", sixteen_vec, self.scratch_const(16))))
+        # emit(("valu", ("vbroadcast", sixteen_vec, self.scratch_const(16))))
         emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
         # 1-based indexing: gather uses forest_p - 1 + idx' instead of forest_p + idx
         forest_p_m1_vec = self.pinned_vreg("forest_p_m1_vec", VLEN)
@@ -1373,7 +1371,7 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors - 2, 4: 1}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 2}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
