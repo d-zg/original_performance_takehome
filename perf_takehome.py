@@ -497,7 +497,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         if target_flow[i] >= 0:
             remaining_to_flow[target_flow[i]] += 1
 
-    active_metric = "load"  # "load", "flow", or "either"
+    active_metric = ""
 
     def sched_key(i):
         if active_metric == "load":
@@ -512,6 +512,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 remaining_to_load.get(target_load[i], n),
                 remaining_to_flow.get(target_flow[i], n),
             )
+        rnd = op_rnd[i] if active_metric == "load" else 0
         return (d, sort_key(i), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
@@ -628,8 +629,8 @@ def schedule(slots, slot_limits, allocator, tags=None):
         # Adaptive starvation: bias remaining-preds metric toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
-        load_starved = n_ready_loads < 24
-        flow_starved = n_ready_flows < slot_limits.get("flow", 1) 
+        load_starved = n_ready_loads < 5
+        flow_starved = n_ready_flows < slot_limits.get("flow", 1) #and not load_starved 
         if flow_starved:
             active_metric = "flow"
         else:
@@ -669,8 +670,33 @@ def schedule(slots, slot_limits, allocator, tags=None):
                           and available.get("alu", 0) > 0)
 
             if not can_native and not can_promote:
-                remaining.append(i)
-                stall_slot += 1
+                # Swap: non-promotable VALU op steals a slot from a promotable one
+                swapped = False
+                if (engine == "valu"
+                    and slots[i][1][0] in ("vbroadcast", "multiply_add")
+                    and available.get("alu", 0) >= VLEN):
+                    # Find a promotable VALU entry in the bundle to demote
+                    for bi, bentry in enumerate(bundle):
+                        if (bentry[0] == "valu"
+                            and bentry[1][0] not in ("vbroadcast", "multiply_add")):
+                            # Demote this entry to valu_as_alu
+                            bundle[bi] = ("valu_as_alu", bentry[1], 0, VLEN)
+                            available["alu"] -= VLEN
+                            # Native VALU slot freed — schedule the non-promotable op natively
+                            swapped = True
+                            break
+                if not swapped:
+                    remaining.append(i)
+                    stall_slot += 1
+                    continue
+                # After swap: schedule non-promotable op on the freed native VALU slot
+                if not try_alloc_or_reuse(i):
+                    remaining.append(i)
+                    stall_alloc += 1
+                    continue
+                physical_args = allocator.rewrite_args(slots[i][1])
+                emit((engine, physical_args), i)
+                # available["valu"] stays the same: we freed one and used one
                 continue
 
             if not try_alloc_or_reuse(i):
@@ -1010,6 +1036,190 @@ class KernelBuilder:
         fig2.savefig("per_round_timeline.png", dpi=150)
         plt.show()
         print("Saved per_round_timeline.png")
+
+        # === Per-vector readiness and scheduling chart ===
+        op_stats = self._op_stats
+        total_cycles = df["end"].max() + 2
+        n_vectors = max(op["vi"] for op in op_stats if op["vi"] >= 0) + 1
+
+        # For each op: it's "available" during [ready, sched) and "scheduled" at sched
+        # Build per-cycle, per-vector: which engine types are available, which were scheduled
+        # available[cycle][vi] = set of engine types with ready ops
+        # scheduled[cycle][vi] = dict of engine -> count of ops scheduled
+
+        avail_valu = [[0] * n_vectors for _ in range(total_cycles)]
+        avail_load = [[0] * n_vectors for _ in range(total_cycles)]
+        avail_flow = [[0] * n_vectors for _ in range(total_cycles)]
+        sched_valu = [[0] * n_vectors for _ in range(total_cycles)]
+        sched_load = [[0] * n_vectors for _ in range(total_cycles)]
+        sched_flow = [[0] * n_vectors for _ in range(total_cycles)]
+
+        for op in op_stats:
+            vi = op["vi"]
+            if vi < 0:
+                continue
+            ready_c = op["ready"]
+            sched_c = op["cycle"]
+            named = op.get("named", "")
+            # Determine engine type from the named string
+            if named.startswith("(valu") or named.startswith("(flex_alu"):
+                eng = "valu"
+            elif named.startswith("(load"):
+                eng = "load"
+            elif named.startswith("(flow"):
+                eng = "flow"
+            elif named.startswith("(store"):
+                eng = "load"  # group with load for simplicity
+            else:
+                eng = "valu"  # default
+
+            # Available: ready but not yet scheduled
+            for c in range(max(ready_c, 0), min(sched_c, total_cycles)):
+                if eng == "valu":
+                    avail_valu[c][vi] += 1
+                elif eng == "load":
+                    avail_load[c][vi] += 1
+                elif eng == "flow":
+                    avail_flow[c][vi] += 1
+
+            # Scheduled
+            if 0 <= sched_c < total_cycles:
+                if eng == "valu":
+                    sched_valu[sched_c][vi] += 1
+                elif eng == "load":
+                    sched_load[sched_c][vi] += 1
+                elif eng == "flow":
+                    sched_flow[sched_c][vi] += 1
+
+        # Aggregate: per cycle, how many of the 32 vectors have each type available
+        cycles = range(total_cycles)
+        n_with_valu = [sum(1 for vi in range(n_vectors) if avail_valu[c][vi] > 0) for c in cycles]
+        n_with_load = [sum(1 for vi in range(n_vectors) if avail_load[c][vi] > 0) for c in cycles]
+        n_with_flow = [sum(1 for vi in range(n_vectors) if avail_flow[c][vi] > 0) for c in cycles]
+        n_idle = [n_vectors - sum(1 for vi in range(n_vectors)
+                  if avail_valu[c][vi] > 0 or avail_load[c][vi] > 0 or avail_flow[c][vi] > 0
+                  or sched_valu[c][vi] > 0 or sched_load[c][vi] > 0 or sched_flow[c][vi] > 0)
+                  for c in cycles]
+
+        # Aggregate: per cycle, how many vectors had ops scheduled by type
+        n_did_valu = [sum(1 for vi in range(n_vectors) if sched_valu[c][vi] > 0) for c in cycles]
+        n_did_load = [sum(1 for vi in range(n_vectors) if sched_load[c][vi] > 0) for c in cycles]
+        n_did_flow = [sum(1 for vi in range(n_vectors) if sched_flow[c][vi] > 0) for c in cycles]
+
+        fig3, (ax_avail, ax_sched) = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
+
+        # Top: how many vectors have each type available
+        ax_avail.plot(cycles, n_with_valu, label="valu available", color="blue", alpha=0.8)
+        ax_avail.plot(cycles, n_with_load, label="load available", color="red", alpha=0.8)
+        ax_avail.plot(cycles, n_with_flow, label="flow available", color="green", alpha=0.8)
+        ax_avail.plot(cycles, n_idle, label="idle (nothing ready)", color="gray", alpha=0.5)
+        ax_avail.set_ylabel("# vectors (of 32)")
+        ax_avail.set_title("Available work: vectors with ready ops by engine type")
+        ax_avail.legend(loc="upper right")
+        ax_avail.set_ylim(0, n_vectors + 1)
+
+        # Bottom: actual slot usage from bundles (valu_as_alu counts as fraction)
+        bundles = self._bundles_for_stats
+        total_valu = [0.0] * len(bundles)
+        total_alu = [0.0] * len(bundles)
+        total_load = [0.0] * len(bundles)
+        total_flow = [0.0] * len(bundles)
+        for ci, bundle in enumerate(bundles):
+            for slot in bundle:
+                eng = slot[0]
+                if eng == "valu":
+                    total_valu[ci] += 1
+                elif eng == "valu_as_alu":
+                    # Each scalar ALU op = 1/VLEN of a VALU op
+                    total_valu[ci] += slot[3] / VLEN
+                    total_alu[ci] += slot[3]
+                elif eng == "alu":
+                    total_alu[ci] += 1
+                elif eng == "load":
+                    total_load[ci] += 1
+                elif eng == "store":
+                    total_load[ci] += 1  # group with load
+                elif eng == "flow":
+                    total_flow[ci] += 1
+        bcycles = range(len(bundles))
+        ax_sched.plot(bcycles, total_valu, label=f"valu equiv (max {SLOT_LIMITS['valu']})", color="blue", alpha=0.8, linewidth=0.8)
+        ax_sched.plot(bcycles, total_load, label=f"load+store (max {SLOT_LIMITS['load']})", color="red", alpha=0.8, linewidth=0.8)
+        ax_sched.plot(bcycles, total_flow, label=f"flow (max {SLOT_LIMITS['flow']})", color="green", alpha=0.8, linewidth=0.8)
+        ax_sched.plot(bcycles, total_alu, label=f"alu slots (max {SLOT_LIMITS['alu']})", color="purple", alpha=0.5, linewidth=0.8)
+        ax_sched.set_xlabel("Cycle")
+        ax_sched.set_ylabel("Slot usage")
+        ax_sched.set_title("Actual slot usage per cycle (valu_as_alu = 1/8 valu)")
+        ax_sched.legend(loc="upper right")
+        ax_sched.axhline(y=SLOT_LIMITS['valu'], color="blue", linestyle="--", alpha=0.3)
+        ax_sched.axhline(y=SLOT_LIMITS['load'], color="red", linestyle="--", alpha=0.3)
+
+        fig3.tight_layout()
+        fig3.savefig("compute_readiness.png", dpi=150)
+        plt.show()
+        print("Saved compute_readiness.png")
+
+        # === Per-vector readiness and scheduling chart ===
+        # One subplot per vector in a grid, showing:
+        #   - Lines: # of ready (available) ops by engine type
+        #   - Filled bars: # of scheduled ops by engine type
+        #   - Vertical lines: round completion times
+        ncols_v = 4
+        nrows_v = (n_vectors + ncols_v - 1) // ncols_v
+        fig4, axes4 = plt.subplots(nrows_v, ncols_v, figsize=(5 * ncols_v, 3 * nrows_v), sharex=True)
+        axes4_flat = axes4.flatten() if hasattr(axes4, 'flatten') else [axes4]
+
+        # Get round completion times per vector from timing data
+        vi_rnd_end = {}  # (vi, rnd) -> end cycle
+        for (vi_t, rnd_t), info in self.vi_rnd_timing.items():
+            vi_rnd_end[(vi_t, rnd_t)] = info["end"]
+
+        for vi in range(n_vectors):
+            ax = axes4_flat[vi]
+
+            vi_avail_valu = [avail_valu[c][vi] for c in cycles]
+            vi_avail_load = [avail_load[c][vi] for c in cycles]
+            vi_avail_flow = [avail_flow[c][vi] for c in cycles]
+            vi_sched_valu = [sched_valu[c][vi] for c in cycles]
+            vi_sched_load = [sched_load[c][vi] for c in cycles]
+            vi_sched_flow = [sched_flow[c][vi] for c in cycles]
+
+            # Available ops (lines)
+            ax.plot(list(cycles), vi_avail_valu, color="blue", alpha=0.5, linewidth=0.7, label="valu avail")
+            ax.plot(list(cycles), vi_avail_load, color="red", alpha=0.5, linewidth=0.7, label="load avail")
+            ax.plot(list(cycles), vi_avail_flow, color="green", alpha=0.5, linewidth=0.7, label="flow avail")
+
+            # Scheduled ops (filled)
+            ax.fill_between(list(cycles), vi_sched_valu, color="blue", alpha=0.3, step="mid")
+            ax.fill_between(list(cycles), vi_sched_load, color="red", alpha=0.3, step="mid")
+            ax.fill_between(list(cycles), vi_sched_flow, color="green", alpha=0.3, step="mid")
+
+            # Compute y limit from data
+            ymax = max(max(vi_avail_valu, default=0), max(vi_avail_load, default=0),
+                       max(vi_avail_flow, default=0), 1)
+            ax.set_ylim(0, ymax + 1)
+
+            # Round completion annotations
+            rnd_colors = plt.cm.tab10
+            for rnd_t in sorted(set(r for (v, r) in vi_rnd_end if v == vi)):
+                end_c = vi_rnd_end.get((vi, rnd_t))
+                if end_c is not None:
+                    ax.axvline(x=end_c, color=rnd_colors(rnd_t % 10), linestyle="--", alpha=0.6, linewidth=0.5)
+                    ax.text(end_c, ymax + 0.5, f"r{rnd_t}", fontsize=4, rotation=90,
+                            va="top", ha="right", color=rnd_colors(rnd_t % 10))
+
+            ax.set_title(f"v{vi}", fontsize=8)
+
+        # Add legend to first subplot
+        axes4_flat[0].legend(fontsize=5, loc="upper right")
+        # Hide unused subplots
+        for idx in range(n_vectors, len(axes4_flat)):
+            axes4_flat[idx].set_visible(False)
+
+        fig4.suptitle("Per-vector: available ops (lines) vs scheduled ops (filled) + round completions", fontsize=12)
+        fig4.tight_layout()
+        fig4.savefig("per_vector_readiness.png", dpi=150)
+        plt.show()
+        print("Saved per_vector_readiness.png")
 
     def debug_info(self):
         return DebugInfo(
@@ -1361,7 +1571,7 @@ class KernelBuilder:
             # Tag as prev flight (rnd-1) so it's part of the previous flight.
             setup_rnd = rnd - 1 if rnd > 0 else -1
 
-            if k <= 4:
+            if k <= 3:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -1371,14 +1581,14 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 4}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 0}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 4 and vi < mux_count.get(k, 0):
+                if k <= 3 and vi < mux_count.get(k, 0):
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=setup_rnd)
 
