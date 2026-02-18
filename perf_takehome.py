@@ -256,30 +256,34 @@ def build_dag(slots):
 def compute_distances(slots, predecessors):
     """Compute BFS distance from each op to its nearest load and flow successor.
 
-    Used to prioritize ops that feed into bottleneck engines.
-    Returns (dist_to_load, dist_to_flow, dist_to_either).
+    Also tracks which specific load/flow op each op feeds into (target).
+    Returns (dist_to_load, dist_to_flow, dist_to_either,
+             target_load, target_flow).
     """
     n = len(slots)
 
     def bfs_dist(target_engines):
         dist = [n] * n
+        target = [-1] * n  # which specific bottleneck op this feeds
         queue = deque()
         for i in range(n):
             if slots[i][0] in target_engines:
                 dist[i] = 0
+                target[i] = i
                 queue.append(i)
         while queue:
             j = queue.popleft()
             for pred in predecessors[j]:
                 if dist[pred] > dist[j] + 1:
                     dist[pred] = dist[j] + 1
+                    target[pred] = target[j]
                     queue.append(pred)
-        return dist
+        return dist, target
 
-    dist_to_load = bfs_dist(("load",))
-    dist_to_flow = bfs_dist(("flow",))
+    dist_to_load, target_load = bfs_dist(("load",))
+    dist_to_flow, target_flow = bfs_dist(("flow",))
     dist_to_either = [min(dist_to_load[i], dist_to_flow[i]) for i in range(n)]
-    return dist_to_load, dist_to_flow, dist_to_either
+    return dist_to_load, dist_to_flow, dist_to_either, target_load, target_flow
 
 
 def compute_use_counts(slot_uses):
@@ -310,7 +314,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         return [], []
 
     slot_defs, slot_uses, successors, predecessors, in_degree = build_dag(slots)
-    dist_to_load, dist_to_flow, dist_to_either = compute_distances(slots, predecessors)
+    dist_to_load, dist_to_flow, dist_to_either, target_load, target_flow = compute_distances(slots, predecessors)
     remaining_uses = compute_use_counts(slot_uses)
 
     # === Active set management ===
@@ -376,6 +380,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
     # Per-vector round tracking
     total_ops_per_vi_rnd = {k: len(v) for k, v in ops_per_vi_rnd.items()}
     scheduled_per_vi_rnd = defaultdict(int)
+    vi_rnd_start_cycle = {}  # (vi, rnd) -> cycle when first op scheduled
     vector_current_round = {}
     for vi in all_vectors:
         vector_current_round[vi] = min(vi_rounds[vi])
@@ -481,12 +486,33 @@ def schedule(slots, slot_limits, allocator, tags=None):
 
     # --- Scheduling state ---
 
-    active_dist = dist_to_either  # default, updated each cycle
+    # Dynamic remaining-predecessors metric: for each bottleneck op (load/flow),
+    # count how many unscheduled ops feed into it. As we schedule ops, the count
+    # drops, creating momentum toward finishing a group.
+    remaining_to_load = defaultdict(int)
+    remaining_to_flow = defaultdict(int)
+    for i in range(n):
+        if target_load[i] >= 0:
+            remaining_to_load[target_load[i]] += 1
+        if target_flow[i] >= 0:
+            remaining_to_flow[target_flow[i]] += 1
+
+    active_metric = "either"  # "load", "flow", or "either"
 
     def sched_key(i):
-        vi = op_vi[i]
-        vp = vector_priority.get(vi, 1) if vi >= 0 else 1
-        return (active_dist[i], sort_key(i), i)
+        if active_metric == "load":
+            d = dist_to_load[i]
+            r = remaining_to_load.get(target_load[i], n)
+        elif active_metric == "flow":
+            d = dist_to_flow[i]
+            r = remaining_to_flow.get(target_flow[i], n)
+        else:
+            d = dist_to_either[i]
+            r = min(
+                remaining_to_load.get(target_load[i], n),
+                remaining_to_flow.get(target_flow[i], n),
+            )
+        return (d, sort_key(i), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
     bundles = []
@@ -532,13 +558,21 @@ def schedule(slots, slot_limits, allocator, tags=None):
         remaining = []
         pending_frees = []
 
+        def mark_scheduled(i):
+            """Update dynamic metrics and bookkeeping when op i completes."""
+            scheduled_this_cycle.append(i)
+            op_scheduled_cycle[i] = cycle_num
+            pending_frees.extend(consume_uses(i))
+            if target_load[i] >= 0:
+                remaining_to_load[target_load[i]] -= 1
+            if target_flow[i] >= 0:
+                remaining_to_flow[target_flow[i]] -= 1
+
         def emit(slot_tuple, i):
             """Append a slot to the bundle and mark op i as scheduled."""
             bundle.append(slot_tuple)
             bundle_meta.append(build_meta(i))
-            scheduled_this_cycle.append(i)
-            op_scheduled_cycle[i] = cycle_num
-            pending_frees.extend(consume_uses(i))
+            mark_scheduled(i)
 
         # Re-admit vectors to active set based on scheduling priority
         if has_vectors and len(active_set) < MAX_ACTIVE:
@@ -546,7 +580,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
             candidate_vis = {}
             for i in ready:
                 vi_i = op_vi[i]
-                if vi_i >= 0 and vi_i not in active_set and slots[i][0] not in ("load", "flow", "store"):
+                if vi_i >= 0 and vi_i not in active_set:
                     if vi_i not in candidate_vis or sched_key(i) < candidate_vis[vi_i]:
                         candidate_vis[vi_i] = sched_key(i)
             # Admit best candidates up to MAX_ACTIVE
@@ -570,9 +604,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
             partial_ops[i] = done_so_far + can_do
             if partial_ops[i] >= VLEN:
                 del partial_ops[i]
-                scheduled_this_cycle.append(i)
-                op_scheduled_cycle[i] = cycle_num
-                pending_frees.extend(consume_uses(i))
+                mark_scheduled(i)
 
         # Compute vector priorities based on turnaround cost to VALU work
         if has_vectors:
@@ -593,17 +625,17 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 for vi in active_set:
                     vector_priority[vi] = 0
 
-        # Original adaptive heuristic: bias toward starved resource
+        # Adaptive starvation: bias remaining-preds metric toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
         load_starved = n_ready_loads < slot_limits.get("load", 2)
         flow_starved = n_ready_flows < slot_limits.get("flow", 1)
         if load_starved and not flow_starved:
-            active_dist = dist_to_load
+            active_metric = "load"
         elif flow_starved and not load_starved:
-            active_dist = dist_to_flow
+            active_metric = "flow"
         else:
-            active_dist = dist_to_either
+            active_metric = "either"
 
         ready.sort(key=sched_key)
 
@@ -611,9 +643,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
         for i in ready:
             engine = slots[i][0]
 
-            # Active set gating: only gate compute ops (valu/alu), not load/flow
+            # Active set gating: gate ALL ops for inactive vectors
             vi_i = op_vi[i]
-            if vi_i >= 0 and vi_i not in active_set and engine not in ("load", "flow", "store"):
+            if vi_i >= 0 and vi_i not in active_set:
                 remaining.append(i)
                 continue
 
@@ -665,8 +697,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 available["alu"] -= can_do
                 op_scheduled_cycle[i] = cycle_num
                 if can_do >= VLEN:
-                    scheduled_this_cycle.append(i)
-                    pending_frees.extend(consume_uses(i))
+                    mark_scheduled(i)
                 else:
                     partial_ops[i] = can_do
 
@@ -693,8 +724,12 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     continue
                 key = (vi_s, rnd_s)
                 if key in total_ops_per_vi_rnd:
+                    if key not in vi_rnd_start_cycle:
+                        vi_rnd_start_cycle[key] = cycle_num
                     scheduled_per_vi_rnd[key] += 1
                     if scheduled_per_vi_rnd[key] >= total_ops_per_vi_rnd[key]:
+                        start_c = vi_rnd_start_cycle.get(key, -1)
+                        print(f"  (vi={vi_s}, rnd={rnd_s}) done cycle={cycle_num} (started={start_c}, dur={cycle_num - start_c})")
                         # (vi, rnd) complete — advance vector to next round
                         next_rounds = sorted(
                             r for r in vi_rounds[vi_s]
@@ -712,8 +747,8 @@ def schedule(slots, slot_limits, allocator, tags=None):
             cycle_num += 1
         elif not partial_ops:
             if ready:
-                gated = [i for i in ready if op_vi[i] >= 0 and op_vi[i] not in active_set and slots[i][0] not in ("load", "flow", "store")]
-                not_gated = [i for i in ready if not (op_vi[i] >= 0 and op_vi[i] not in active_set and slots[i][0] not in ("load", "flow", "store"))]
+                gated = [i for i in ready if op_vi[i] >= 0 and op_vi[i] not in active_set]
+                not_gated = [i for i in ready if not (op_vi[i] >= 0 and op_vi[i] not in active_set)]
                 engines = Counter(slots[i][0] for i in ready)
                 print(f"  DEADLOCK cycle={cycle_num}: {len(ready)} ready, {len(gated)} gated, {len(not_gated)} not gated")
                 print(f"  Engines: {dict(engines)}, Scratch: {allocator.current_usage()}/{allocator.scratch_size}")
@@ -1150,19 +1185,25 @@ class KernelBuilder:
             return slots, broadcast_vregs[0]
 
         if k == 1:
-            # Special case: idx is always 1 or 2 at k=1. idx&1 gives inverted bit,
-            # so swap vselect args to avoid the subtract.
+            # 1-based: idx' is 2 or 3 at k=1. idx'&1 = 0 for left (node 2), 1 for right (node 3).
             bit = self.new_vreg_vec(f"bit_0_stage0_vec{index}")
             slots.append(("valu", ("&", bit, idx_vreg, self.pinned_vreg("one_vec", VLEN))))
             result = self.new_vreg_vec(f"mux_stage0_vec{index}_0")
-            slots.append(("flow", ("vselect", result, bit, broadcast_vregs[0], broadcast_vregs[1])))
+            # Non-inverted: bit=0 selects broadcast[0] (left), bit=1 selects broadcast[1] (right)
+            slots.append(("flow", ("vselect", result, bit, broadcast_vregs[1], broadcast_vregs[0])))
             return slots, result
 
+        # 1-based: level k starts at 2^k, so position = low k bits of idx'.
+        # No subtract needed — bit extraction only looks at low bits.
+        # Subtract kept: removing it saves ops but hurts scheduling (fewer deps = more
+        # scratch pressure). With subtract: 1231 cycles, without: 1266 cycles.
+        _level_start_1based = {2: "four_vec", 3: "eight_vec", 4: "sixteen_vec"}
         adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx_vec{index}")
-        slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(f"level_start{k}_vec", VLEN))))
+        slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(_level_start_1based[k], VLEN))))
+        bit_source = adjusted_idx
 
         for stage in range(k):
-            shift_slots, condition_vreg = extract_bit(adjusted_idx, stage, stage, index)
+            shift_slots, condition_vreg = extract_bit(bit_source, stage, stage, index)
             slots.extend(shift_slots)
             next_vregs = []
             for i in range(max(len(remaining_vregs)//2, 1)):
@@ -1251,6 +1292,7 @@ class KernelBuilder:
         two_vec = self.pinned_vreg("two_vec", VLEN)
         four_vec = self.pinned_vreg("four_vec", VLEN)
         eight_vec = self.pinned_vreg("eight_vec", VLEN)
+        sixteen_vec = self.pinned_vreg("sixteen_vec", VLEN)
         forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
         emit(("valu", ("vbroadcast", zero_vec, zero_const)))
@@ -1258,14 +1300,17 @@ class KernelBuilder:
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", four_vec, self.scratch_const(4))))
         emit(("valu", ("vbroadcast", eight_vec, self.scratch_const(8))))
+        emit(("valu", ("vbroadcast", sixteen_vec, self.scratch_const(16))))
         emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
-        # Level start broadcasts for mux subtract (k=0 unused, k=1 uses idx&1 directly)
-        level_start2_vec = self.pinned_vreg("level_start2_vec", VLEN)
-        emit(("valu", ("vbroadcast", level_start2_vec, self.scratch_const(3))))
-        level_start3_vec = self.pinned_vreg("level_start3_vec", VLEN)
-        emit(("valu", ("vbroadcast", level_start3_vec, self.scratch_const(7))))
-        level_start4_vec = self.pinned_vreg("level_start4_vec", VLEN)
-        emit(("valu", ("vbroadcast", level_start4_vec, self.scratch_const(15))))
+        # 1-based indexing: gather uses forest_p - 1 + idx' instead of forest_p + idx
+        forest_p_m1_vec = self.pinned_vreg("forest_p_m1_vec", VLEN)
+        minus_one_const = self.scratch_const(0xFFFFFFFF)  # -1 mod 2^32
+        emit(("valu", ("vbroadcast", forest_p_m1_vec, minus_one_const)))
+        # forest_p_m1_vec = forest_p_vec + (-1) = forest_p - 1
+        forest_p_m1_final = self.pinned_vreg("forest_p_m1_final", VLEN)
+        emit(("valu", ("+", forest_p_m1_final, forest_p_vec, forest_p_m1_vec)))
+        # 1-based indexing: level start constants are powers of 2, already broadcast
+        # as four_vec (k=2) and eight_vec (k=3). No extra broadcasts needed.
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
@@ -1298,10 +1343,13 @@ class KernelBuilder:
             emit(("flex_alu_add", ("+", idx_base, param_vregs["inp_indices_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
             emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
 
-            idx_v = self.new_vreg_vec(f"idx_init_v{vi}")
+            idx_v_raw = self.new_vreg_vec(f"idx_raw_v{vi}")
             val_v = self.new_vreg_vec(f"val_init_v{vi}")
-            emit(("load", ("vload", idx_v, idx_base)), vi=vi, rnd=-1)
+            emit(("load", ("vload", idx_v_raw, idx_base)), vi=vi, rnd=-1)
             emit(("load", ("vload", val_v, val_base)), vi=vi, rnd=-1)
+            # Convert to 1-based indexing: idx' = idx + 1
+            idx_v = self.new_vreg_vec(f"idx_init_v{vi}")
+            emit(("valu", ("+", idx_v, idx_v_raw, one_vec)), vi=vi, rnd=-1)
             idx_vecs.append(idx_v)
             val_vecs.append(val_v)
 
@@ -1311,17 +1359,21 @@ class KernelBuilder:
             new_idx_vecs = []
             new_val_vecs = []
             k = rnd % (forest_height + 1)
+            # Mux/gather sets up node values for this round's hash.
+            # Tag as prev flight (rnd-1) so it's part of the previous flight.
+            setup_rnd = rnd - 1 if rnd > 0 else -1
+
             if k <= 3:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
                     preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
-                    emit_all(preload_slots, rnd=rnd)
+                    emit_all(preload_slots, rnd=setup_rnd)
                     cached_broadcasts[k] = broadcast_vregs
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 3}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors - 2, 4: 1}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
@@ -1330,15 +1382,16 @@ class KernelBuilder:
                 # Compute gather addresses: addr = forest_p + idx
                 if k <= 3 and vi < mux_count[k]:
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
-                    emit_all(select_slots, vi=vi, rnd=rnd)
+                    emit_all(select_slots, vi=vi, rnd=setup_rnd)
 
                 else:
                     addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
-                    emit(("valu", ("+", addr_vec, forest_p_vec, idx_loaded)), vi=vi, rnd=rnd)
+                    # 1-based: addr = (forest_p - 1) + idx'
+                    emit(("valu", ("+", addr_vec, forest_p_m1_final, idx_loaded)), vi=vi, rnd=setup_rnd)
 
                     # Gather node values from tree (still from main memory)
                     gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
-                    emit_all(gather_slots, vi=vi, rnd=rnd)
+                    emit_all(gather_slots, vi=vi, rnd=setup_rnd)
 
                 # val = val ^ node_val
                 val_xored = self.new_vreg_vec(f"xor_r{rnd}_v{vi}")
@@ -1349,25 +1402,15 @@ class KernelBuilder:
                 emit_all(hash_slots, vi=vi, rnd=rnd)
 
                 if k == forest_height:
-                    # At leaves: idx always wraps to 0, skip entire idx computation
-                    new_idx_vecs.append(zero_vec)
-                elif idx_loaded is zero_vec:
-                    # idx was reset to 0 (came from leaf): 2*0+1+parity = 1+parity
-                    parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
-                    idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
-
-                    emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
-                    emit(("valu", ("+", idx_next, one_vec, parity)), vi=vi, rnd=rnd)
-                    new_idx_vecs.append(idx_next)
+                    # At leaves: idx wraps to root. 1-based root = 1
+                    new_idx_vecs.append(one_vec)
                 else:
-                    # idx = 2*idx + 1 + (val & 1)
+                    # 1-based: idx_next' = 2*idx' + parity (2 ops instead of 3)
                     parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
-                    idx_doubled_plus1 = self.new_vreg_vec(f"idx2p1_r{rnd}_v{vi}")
                     idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
 
                     emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
-                    emit(("valu", ("multiply_add", idx_doubled_plus1, idx_loaded, two_vec, one_vec)), vi=vi, rnd=rnd)
-                    emit(("valu", ("+", idx_next, idx_doubled_plus1, parity)), vi=vi, rnd=rnd)
+                    emit(("valu", ("multiply_add", idx_next, idx_loaded, two_vec, parity)), vi=vi, rnd=rnd)
                     new_idx_vecs.append(idx_next)
 
                 new_val_vecs.append(val_hashed)
@@ -1376,14 +1419,20 @@ class KernelBuilder:
             val_vecs = new_val_vecs
 
         # Store final results back to memory (once)
+        # Convert idx back from 1-based to 0-based: idx = idx' - 1 = idx' + 0xFFFFFFFF
+        minus_one_vec = self.pinned_vreg("minus_one_vec", VLEN)
+        emit(("valu", ("vbroadcast", minus_one_vec, minus_one_const)))
         for vi in range(n_vectors):
             offset_imm = vi * VLEN
             offset_const = self.scratch_const(offset_imm)
             idx_base = self.new_vreg(f"idx_base_final_v{vi}")
             val_base = self.new_vreg(f"val_base_final_v{vi}")
+            # Convert 1-based idx back to 0-based
+            idx_0based = self.new_vreg_vec(f"idx_0based_v{vi}")
+            emit(("valu", ("+", idx_0based, idx_vecs[vi], minus_one_vec)), vi=vi, rnd=rounds)
             emit(("flex_alu_add", ("+", idx_base, param_vregs["inp_indices_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
             emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
-            emit(("store", ("vstore", idx_base, idx_vecs[vi])), vi=vi, rnd=rounds)
+            emit(("store", ("vstore", idx_base, idx_0based)), vi=vi, rnd=rounds)
             emit(("store", ("vstore", val_base, val_vecs[vi])), vi=vi, rnd=rounds)
 
         # Prepend all setup loads to body for scheduling
