@@ -513,7 +513,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 remaining_to_flow.get(target_flow[i], n),
             )
         rnd = op_rnd[i] if active_metric == "load" else 0
-        return (d, sort_key(i), i)
+        return (r, d, sort_key(i), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
     bundles = []
@@ -557,6 +557,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         available = dict(slot_limits)
         scheduled_this_cycle = []
         remaining = []
+        deferred_flex = []
         pending_frees = []
 
         def mark_scheduled(i):
@@ -629,9 +630,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
         # Adaptive starvation: bias remaining-preds metric toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
-        load_starved = n_ready_loads < 5
-        flow_starved = n_ready_flows < slot_limits.get("flow", 1) #and not load_starved 
-        if flow_starved:
+        load_starved = n_ready_loads < 6
+        flow_starved = n_ready_flows < slot_limits.get("flow", 1) and not load_starved
+        if n_ready_loads > 14 or flow_starved:
             active_metric = "flow"
         else:
             active_metric = "load"
@@ -651,8 +652,8 @@ def schedule(slots, slot_limits, allocator, tags=None):
             if engine == "flex_alu_add":
                 # flex_alu_add: scalar add emitted as alu, args trimmed to drop imm
                 if available.get("alu", 0) <= 0:
-                    remaining.append(i)
-                    stall_slot += 1
+                    # Defer — might promote to flow after main loop
+                    deferred_flex.append(i)
                     continue
                 if not try_alloc_or_reuse(i):
                     remaining.append(i)
@@ -725,6 +726,23 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 else:
                     partial_ops[i] = can_do
 
+        # Deferred flex_alu_add → flow promotion (add_imm)
+        for i in deferred_flex:
+            if available.get("flow", 0) > 0:
+                if not try_alloc_or_reuse(i):
+                    remaining.append(i)
+                    stall_alloc += 1
+                    continue
+                physical_args = allocator.rewrite_args(slots[i][1])
+                # flex_alu_add args: ("+", dest, src, offset_vreg, offset_imm)
+                # flow add_imm: ("add_imm", dest, src, imm)
+                imm = slots[i][1][4]  # grab imm before rewrite (it's a plain int)
+                emit(("flow", ("add_imm", physical_args[1], physical_args[2], imm)), i)
+                available["flow"] -= 1
+            else:
+                remaining.append(i)
+                stall_slot += 1
+
         allocator.track_peak(cycle_num)
 
         for vreg in pending_frees:
@@ -776,10 +794,29 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 engines = Counter(slots[i][0] for i in ready)
                 print(f"  DEADLOCK cycle={cycle_num}: {len(ready)} ready, {len(gated)} gated, {len(not_gated)} not gated")
                 print(f"  Engines: {dict(engines)}, Scratch: {allocator.current_usage()}/{allocator.scratch_size}")
+                print(f"  Active metric: {active_metric}")
                 print(f"  Active set ({len(active_set)}): {sorted(active_set)}")
-                for i in not_gated[:10]:
-                    defs = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg)]
-                    print(f"    op {i}: {op_desc(i)} vi={op_vi[i]} rnd={op_rnd[i]} engine={slots[i][0]} defs={defs}")
+                # Classify why each not-gated op failed
+                reasons = Counter()
+                for i in not_gated:
+                    eng = slots[i][0]
+                    can_native = available.get(eng, 0) > 0
+                    can_promo = (eng == "valu" and slots[i][1][0] not in ("vbroadcast", "multiply_add") and available.get("alu", 0) > 0)
+                    if not can_native and not can_promo:
+                        reasons["no_slot"] += 1
+                    else:
+                        reasons["alloc_fail"] += 1
+                print(f"  Failure reasons: {dict(reasons)}")
+                # Show rounds of not-gated ops
+                rnd_counts = Counter(op_rnd[i] for i in not_gated)
+                print(f"  Rounds of stuck ops: {dict(sorted(rnd_counts.items()))}")
+                vi_counts = Counter(op_vi[i] for i in not_gated)
+                print(f"  Vectors of stuck ops: {dict(sorted(vi_counts.items()))}")
+                # Show sample ops with allocation details
+                for i in not_gated[:15]:
+                    defs = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
+                    uses = [(resolve_parent(v).name_hint, remaining_uses.get(resolve_parent(v), 0)) for v in slot_uses[i] if isinstance(resolve_parent(v), VReg) and resolve_parent(v).pinned_addr is None]
+                    print(f"    op {i}: {op_desc(i)} vi={op_vi[i]} rnd={op_rnd[i]} engine={slots[i][0]} defs={defs} uses_remaining={uses}")
                 raise RuntimeError(
                     f"Scheduler deadlock: {len(ready)} ready ops but none schedulable."
                 )
