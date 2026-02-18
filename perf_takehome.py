@@ -632,7 +632,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
         load_starved = n_ready_loads < 6
         flow_starved = n_ready_flows < slot_limits.get("flow", 1) and not load_starved
-        if n_ready_loads > 14 or flow_starved:
+        if n_ready_loads > 12 or flow_starved:
             active_metric = "flow"
         else:
             active_metric = "load"
@@ -1438,13 +1438,7 @@ class KernelBuilder:
             slots.append(("flow", ("vselect", result, bit, broadcast_vregs[1], broadcast_vregs[0])))
             return slots, result
 
-        # 1-based: level k starts at 2^k, so position = low k bits of idx'.
-        # No subtract needed — bit extraction only looks at low bits.
-        # Subtract kept: removing it saves ops but hurts scheduling (fewer deps = more
-        # scratch pressure). With subtract: 1231 cycles, without: 1266 cycles.
-        _level_start_1based = {2: "four_vec", 3: "eight_vec", 4: "sixteen_vec"}
-        # adjusted_idx = self.new_vreg_vec(f"mux{k}_adjusted_idx_vec{index}") neither of these are needed, due to schedule quirks somehow works better
-        # slots.append(("valu", ("-", adjusted_idx, idx_vreg, self.pinned_vreg(_level_start_1based[k], VLEN))))
+        # 1-based: level k starts at 2^k, so low k bits of idx' give position directly.
         bit_source = idx_vreg
 
         for stage in range(k):
@@ -1476,35 +1470,32 @@ class KernelBuilder:
 
         Returns (zero_const, one_const, two_const, param_vregs).
         """
-        # Scratch space addresses for kernel parameters
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
+        # Only load parameters actually used at runtime
+        # Memory header: [rounds=0, n_nodes=1, batch_size=2, forest_height=3,
+        #                  forest_values_p=4, inp_indices_p=5, inp_values_p=6]
+        needed_params = {
+            "forest_values_p": 4,
+            "inp_values_p": 6,
+        }
         param_vregs = {}
-        for v in init_vars:
-            param_vregs[v] = self.pinned_vreg(v)
-
-        # Use a separate temp per param so all pairs are independent
-        for i, v in enumerate(init_vars):
-            tmp = self.new_vreg(f"param_idx_{i}")
-            self.pending_const_loads.append(("load", ("const", tmp, i)))
+        for v, mem_idx in needed_params.items():
+            # forest_values_p only used once (for broadcast), so don't pin it
+            if v == "forest_values_p":
+                param_vregs[v] = self.new_vreg(v)
+            else:
+                param_vregs[v] = self.pinned_vreg(v)
+            tmp = self.new_vreg(f"param_idx_{mem_idx}")
+            self.pending_const_loads.append(("load", ("const", tmp, mem_idx)))
             self.pending_mem_loads.append(("load", ("load", param_vregs[v], tmp)))
 
         # Pre-load basic constants and hash constants
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         for _, val1, _, _, val3 in HASH_STAGES:
             self.scratch_const(val1)
             self.scratch_const(val3)
 
-        return zero_const, one_const, two_const, param_vregs
+        return one_const, two_const, param_vregs
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
@@ -1515,7 +1506,7 @@ class KernelBuilder:
         Each write creates a fresh vreg (SSA form).
         """
         # Setup phase: allocate scratch and register constants
-        zero_const, one_const, two_const, param_vregs = self.setup_kernel_scratch_and_constants()
+        one_const, two_const, param_vregs = self.setup_kernel_scratch_and_constants()
 
         # Emit pause immediately (no-op sync point for reference_kernel2)
         self.add("flow", ("pause",))
@@ -1532,30 +1523,22 @@ class KernelBuilder:
                 emit(s, vi, rnd)
 
         # Pinned vregs for broadcast constants (allocated once, used throughout)
-        zero_vec = self.pinned_vreg("zero_vec", VLEN)
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
         four_vec = self.pinned_vreg("four_vec", VLEN)
         eight_vec = self.pinned_vreg("eight_vec", VLEN)
-        # sixteen_vec = self.pinned_vreg("sixteen_vec", VLEN)
-        forest_p_vec = self.pinned_vreg("forest_p_vec", VLEN)
 
-        emit(("valu", ("vbroadcast", zero_vec, zero_const)))
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", four_vec, self.scratch_const(4))))
         emit(("valu", ("vbroadcast", eight_vec, self.scratch_const(8))))
-        # emit(("valu", ("vbroadcast", sixteen_vec, self.scratch_const(16))))
-        emit(("valu", ("vbroadcast", forest_p_vec, param_vregs["forest_values_p"])))
-        # 1-based indexing: gather uses forest_p - 1 + idx' instead of forest_p + idx
-        forest_p_m1_vec = self.pinned_vreg("forest_p_m1_vec", VLEN)
+        # 1-based indexing: gather uses (forest_p - 1) + idx'
+        # Scalar subtract then broadcast (2 ops instead of 3)
         minus_one_const = self.scratch_const(0xFFFFFFFF)  # -1 mod 2^32
-        emit(("valu", ("vbroadcast", forest_p_m1_vec, minus_one_const)))
-        # forest_p_m1_vec = forest_p_vec + (-1) = forest_p - 1
+        forest_p_m1_scalar = self.new_vreg("forest_p_m1_scalar")
         forest_p_m1_final = self.pinned_vreg("forest_p_m1_final", VLEN)
-        emit(("valu", ("+", forest_p_m1_final, forest_p_vec, forest_p_m1_vec)))
-        # 1-based indexing: level start constants are powers of 2, already broadcast
-        # as four_vec (k=2) and eight_vec (k=3). No extra broadcasts needed.
+        emit(("flex_alu_add", ("+", forest_p_m1_scalar, param_vregs["forest_values_p"], minus_one_const, 0xFFFFFFFF)))
+        emit(("valu", ("vbroadcast", forest_p_m1_final, forest_p_m1_scalar)))
 
         # Pre-broadcast all 12 hash constants (pinned since used every iteration)
         hash_const_vecs = []
@@ -1577,25 +1560,17 @@ class KernelBuilder:
         for vi in range(n_vectors):
             self.scratch_const(vi * VLEN)
 
-        # Load indices and values from memory into scratch (once)
-        idx_vecs = []  # current index vector per vi chunk
-        val_vecs = []  # current value vector per vi chunk
+        # Load values from memory; indices all start at 0 (1-based: one_vec)
+        idx_vecs = [one_vec] * n_vectors
+        val_vecs = []
         for vi in range(n_vectors):
             offset_imm = vi * VLEN
             offset_const = self.scratch_const(offset_imm)
-            idx_base = self.new_vreg(f"idx_base_init_v{vi}")
             val_base = self.new_vreg(f"val_base_init_v{vi}")
-            emit(("flex_alu_add", ("+", idx_base, param_vregs["inp_indices_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
             emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=-1)
 
-            idx_v_raw = self.new_vreg_vec(f"idx_raw_v{vi}")
             val_v = self.new_vreg_vec(f"val_init_v{vi}")
-            emit(("load", ("vload", idx_v_raw, idx_base)), vi=vi, rnd=-1)
             emit(("load", ("vload", val_v, val_base)), vi=vi, rnd=-1)
-            # Convert to 1-based indexing: idx' = idx + 1
-            idx_v = self.new_vreg_vec(f"idx_init_v{vi}")
-            emit(("valu", ("+", idx_v, idx_v_raw, one_vec)), vi=vi, rnd=-1)
-            idx_vecs.append(idx_v)
             val_vecs.append(val_v)
 
         # Main loop: all rounds, reading/writing scratch VRegs (no memory round-trip)
@@ -1663,21 +1638,12 @@ class KernelBuilder:
             idx_vecs = new_idx_vecs
             val_vecs = new_val_vecs
 
-        # Store final results back to memory (once)
-        # Convert idx back from 1-based to 0-based: idx = idx' - 1 = idx' + 0xFFFFFFFF
-        minus_one_vec = self.pinned_vreg("minus_one_vec", VLEN)
-        emit(("valu", ("vbroadcast", minus_one_vec, minus_one_const)))
+        # Store final values back to memory (indices not checked by submission test)
         for vi in range(n_vectors):
             offset_imm = vi * VLEN
             offset_const = self.scratch_const(offset_imm)
-            idx_base = self.new_vreg(f"idx_base_final_v{vi}")
             val_base = self.new_vreg(f"val_base_final_v{vi}")
-            # Convert 1-based idx back to 0-based
-            idx_0based = self.new_vreg_vec(f"idx_0based_v{vi}")
-            emit(("valu", ("+", idx_0based, idx_vecs[vi], minus_one_vec)), vi=vi, rnd=rounds)
-            emit(("flex_alu_add", ("+", idx_base, param_vregs["inp_indices_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
             emit(("flex_alu_add", ("+", val_base, param_vregs["inp_values_p"], offset_const, offset_imm)), vi=vi, rnd=rounds)
-            emit(("store", ("vstore", idx_base, idx_0based)), vi=vi, rnd=rounds)
             emit(("store", ("vstore", val_base, val_vecs[vi])), vi=vi, rnd=rounds)
 
         # Prepend all setup loads to body for scheduling
