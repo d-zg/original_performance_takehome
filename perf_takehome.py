@@ -497,7 +497,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         if target_flow[i] >= 0:
             remaining_to_flow[target_flow[i]] += 1
 
-    active_metric = "either"  # "load", "flow", or "either"
+    active_metric = "load"  # "load", "flow", or "either"
 
     def sched_key(i):
         if active_metric == "load":
@@ -1361,7 +1361,7 @@ class KernelBuilder:
             # Tag as prev flight (rnd-1) so it's part of the previous flight.
             setup_rnd = rnd - 1 if rnd > 0 else -1
 
-            if k <= 3:
+            if k <= 4:
                 if k in cached_broadcasts:
                     broadcast_vregs = cached_broadcasts[k]
                 else:
@@ -1371,14 +1371,14 @@ class KernelBuilder:
 
             # Optimal mux/gather split: balance flow (mux) vs load (gather)
             # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 2}
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 4}
 
             for vi in range(n_vectors):
                 idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
                 # Compute gather addresses: addr = forest_p + idx
-                if k <= 3 and vi < mux_count[k]:
+                if k <= 4 and vi < mux_count.get(k, 0):
                     select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
                     emit_all(select_slots, vi=vi, rnd=setup_rnd)
 
