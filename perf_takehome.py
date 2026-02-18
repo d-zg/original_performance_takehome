@@ -313,6 +313,66 @@ def schedule(slots, slot_limits, allocator, tags=None):
     dist_to_load, dist_to_flow, dist_to_either = compute_distances(slots, predecessors)
     remaining_uses = compute_use_counts(slot_uses)
 
+    # === Active set management ===
+    MAX_ACTIVE = 32
+    TARGET_GATHER = 3  # target vectors working toward gathers
+    TARGET_MUX = 2     # target vectors working toward mux/vselects
+
+    # Extract per-op vector/round info from tags
+    op_vi = [-1] * n
+    op_rnd = [-1] * n
+    ops_per_vi_rnd = defaultdict(list)
+    vi_rounds = defaultdict(set)
+
+    if tags:
+        for i in range(n):
+            tag = tags[i] if i < len(tags) else None
+            if tag:
+                vi = tag.get('vi', -1)
+                rnd = tag.get('rnd', -1)
+                op_vi[i] = vi
+                op_rnd[i] = rnd
+                if vi >= 0:
+                    vi_rounds[vi].add(rnd)
+                    ops_per_vi_rnd[(vi, rnd)].append(i)
+
+    all_vectors = sorted(vi_rounds.keys())
+    has_vectors = len(all_vectors) > 0
+
+    # Yield type: what bottleneck resource does each (vi, rnd) consume?
+    round_yield_type = {}
+    for (vi, rnd), op_indices in ops_per_vi_rnd.items():
+        if rnd < 0:  # setup ops (initial loads)
+            round_yield_type[(vi, rnd)] = "free"
+            continue
+        has_gather = any(slots[i][0] == "load" and slots[i][1][0] == "load_offset"
+                        for i in op_indices)
+        has_mux = any(slots[i][0] == "flow" and slots[i][1][0] == "vselect"
+                      for i in op_indices)
+        if has_gather:
+            round_yield_type[(vi, rnd)] = "load"
+        elif has_mux:
+            round_yield_type[(vi, rnd)] = "flow"
+        else:
+            round_yield_type[(vi, rnd)] = "free"
+
+    # Active set: first MAX_ACTIVE vectors
+    if has_vectors:
+        active_set = set(all_vectors[:MAX_ACTIVE])
+        inactive_queue = list(all_vectors[MAX_ACTIVE:])
+    else:
+        active_set = set()
+        inactive_queue = []
+
+    # Per-vector round tracking
+    total_ops_per_vi_rnd = {k: len(v) for k, v in ops_per_vi_rnd.items()}
+    scheduled_per_vi_rnd = defaultdict(int)
+    vector_current_round = {}
+    for vi in all_vectors:
+        vector_current_round[vi] = min(vi_rounds[vi])
+
+    vector_priority = {}  # vi -> priority (0=boost, 1=normal)
+
     # --- Metadata helpers (for tracing) ---
 
     def op_desc(i):
@@ -372,10 +432,12 @@ def schedule(slots, slot_limits, allocator, tags=None):
 
     # --- Scheduling state ---
 
-    active_dist = dist_to_either
+    active_dist = dist_to_either  # default, updated each cycle
 
     def sched_key(i):
-        return (active_dist[i], sort_key(i), i)
+        vi = op_vi[i]
+        vp = vector_priority.get(vi, 1) if vi >= 0 else 1
+        return (vp, active_dist[i], sort_key(i), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
     bundles = []
@@ -447,7 +509,37 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 op_scheduled_cycle[i] = cycle_num
                 pending_frees.extend(consume_uses(i))
 
-        # Adapt priority heuristic: feed whichever bottleneck engine is starved
+        # Compute vector priorities based on composition target
+        if has_vectors:
+            n_toward_loads = 0
+            n_toward_flows = 0
+            for vi in active_set:
+                crnd = vector_current_round.get(vi)
+                if crnd is None:
+                    continue
+                yt = round_yield_type.get((vi, crnd), "free")
+                if yt == "load":
+                    n_toward_loads += 1
+                elif yt == "flow":
+                    n_toward_flows += 1
+
+            vector_priority.clear()
+            load_deficit = TARGET_GATHER - n_toward_loads
+            flow_deficit = TARGET_MUX - n_toward_flows
+            for vi in active_set:
+                crnd = vector_current_round.get(vi)
+                if crnd is None:
+                    vector_priority[vi] = 1
+                    continue
+                yt = round_yield_type.get((vi, crnd), "free")
+                if yt == "load" and load_deficit > 0:
+                    vector_priority[vi] = 0  # urgently needed
+                elif yt == "flow" and flow_deficit > 0:
+                    vector_priority[vi] = 0
+                else:
+                    vector_priority[vi] = 1  # normal
+
+        # Original adaptive heuristic: bias toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
         load_starved = n_ready_loads < slot_limits.get("load", 2)
@@ -458,10 +550,17 @@ def schedule(slots, slot_limits, allocator, tags=None):
             active_dist = dist_to_flow
         else:
             active_dist = dist_to_either
+
         ready.sort(key=sched_key)
 
         # Schedule ready ops
         for i in ready:
+            # Active set gating: skip ops for inactive vectors
+            vi_i = op_vi[i]
+            if vi_i >= 0 and vi_i not in active_set:
+                remaining.append(i)
+                continue
+
             engine = slots[i][0]
 
             if engine == "flex_alu_add":
@@ -531,6 +630,31 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     newly_ready.append(succ)
                     ready_cycle[succ] = cycle_num + 1
 
+        # Track per-vector round completion and active set transitions
+        if has_vectors:
+            for i in scheduled_this_cycle:
+                vi_s = op_vi[i]
+                rnd_s = op_rnd[i]
+                if vi_s < 0:
+                    continue
+                key = (vi_s, rnd_s)
+                if key in total_ops_per_vi_rnd:
+                    scheduled_per_vi_rnd[key] += 1
+                    if scheduled_per_vi_rnd[key] >= total_ops_per_vi_rnd[key]:
+                        # (vi, rnd) complete — advance vector to next round
+                        next_rounds = sorted(
+                            r for r in vi_rounds[vi_s]
+                            if scheduled_per_vi_rnd[(vi_s, r)] < total_ops_per_vi_rnd.get((vi_s, r), 0)
+                        )
+                        if next_rounds:
+                            vector_current_round[vi_s] = next_rounds[0]
+                        else:
+                            # Vector fully complete — swap in next inactive vector
+                            active_set.discard(vi_s)
+                            if inactive_queue:
+                                new_vi = inactive_queue.pop(0)
+                                active_set.add(new_vi)
+
         ready = sorted(remaining + newly_ready, key=sched_key)
         if bundle:
             bundles.append(bundle)
@@ -544,6 +668,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
             break
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
+    if has_vectors:
+        print(f"  Active set: max={MAX_ACTIVE}, target_gather={TARGET_GATHER}, target_mux={TARGET_MUX}")
+        print(f"  Vectors: {len(all_vectors)} total, {len(inactive_queue)} remaining inactive")
     return bundles, sched_meta
 
 
