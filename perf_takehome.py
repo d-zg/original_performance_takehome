@@ -216,27 +216,12 @@ class ScratchAllocator:
                 print(f"      {prefix}: {count}")
 
 
-def schedule(slots, slot_limits, allocator, tags=None):
-    """Schedule a segment of ops using list scheduling with integrated allocation.
+def build_dag(slots):
+    """Build a dependency DAG from VReg def-use chains.
 
-    Builds a DAG from VReg def-use chains and greedily packs independent
-    ops into cycles, respecting slot limits. Allocates physical addresses
-    inline — no separate allocation pass needed.
-
-    Args:
-        slots: List of (engine, args) tuples with VRegs
-        slot_limits: Dict of {engine: max_per_cycle}
-        allocator: ScratchAllocator instance for physical address management
-        tags: Optional list of dicts parallel to slots with metadata (vi, rnd, etc.)
-
-    Returns:
-        (bundles, sched_meta) where bundles have physical addresses
+    Returns (slot_defs, slot_uses, successors, predecessors, in_degree).
     """
     n = len(slots)
-    if n == 0:
-        return [], []
-
-    # Step 1: Compute defs/uses per slot
     slot_defs = []
     slot_uses = []
     for engine, args in slots:
@@ -244,7 +229,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
         slot_defs.append(d)
         slot_uses.append(u)
 
-    # Step 2: Build DAG
     vreg_definers = defaultdict(list)
     successors = [[] for _ in range(n)]
     predecessors = [[] for _ in range(n)]
@@ -266,28 +250,17 @@ def schedule(slots, slot_limits, allocator, tags=None):
         for vreg in slot_defs[i]:
             vreg_definers[vreg].append(i)
 
-    def op_desc(i):
-        """Human-readable description of op i using vreg names."""
-        engine, args = slots[i]
-        op_name = args[0] if args else ""
-        # Get dest vreg name
-        dest = ""
-        if len(args) > 1 and isinstance(args[1], VReg):
-            dest = args[1].name_hint or f"v{args[1].id}"
-        return f"{engine} {op_name} {dest}".strip()
+    return slot_defs, slot_uses, successors, predecessors, in_degree
 
-    def named_args(i):
-        """Capture vreg names from original slot args (before address rewrite)."""
-        engine, args = slots[i]
-        named = []
-        for a in args:
-            if isinstance(a, VReg):
-                named.append(a.name_hint or f"v{a.id}")
-            else:
-                named.append(a)
-        return f"({engine} {' '.join(str(x) for x in named)})"
 
-    # Step 2.5: Compute distance-to-nearest-load and distance-to-nearest-flow separately
+def compute_distances(slots, predecessors):
+    """Compute BFS distance from each op to its nearest load and flow successor.
+
+    Used to prioritize ops that feed into bottleneck engines.
+    Returns (dist_to_load, dist_to_flow, dist_to_either).
+    """
+    n = len(slots)
+
     def bfs_dist(target_engines):
         dist = [n] * n
         queue = deque()
@@ -306,15 +279,56 @@ def schedule(slots, slot_limits, allocator, tags=None):
     dist_to_load = bfs_dist(("load",))
     dist_to_flow = bfs_dist(("flow",))
     dist_to_either = [min(dist_to_load[i], dist_to_flow[i]) for i in range(n)]
+    return dist_to_load, dist_to_flow, dist_to_either
 
-    # Step 2.6: Compute use counts for freeing
+
+def compute_use_counts(slot_uses):
+    """Count how many ops use each vreg (resolving parent aliases).
+
+    Returns a dict of {vreg: remaining_use_count} for non-pinned vregs.
+    """
     use_count = defaultdict(int)
-    for i in range(n):
-        for vreg in slot_uses[i]:
+    for uses in slot_uses:
+        for vreg in uses:
             v = vreg.parent if (hasattr(vreg, 'parent') and vreg.parent is not None) else vreg
             if isinstance(v, VReg) and v.pinned_addr is None:
                 use_count[v] += 1
-    remaining_uses = dict(use_count)
+    return dict(use_count)
+
+
+def schedule(slots, slot_limits, allocator, tags=None):
+    """Schedule ops using list scheduling with integrated register allocation.
+
+    Builds a DAG from VReg def-use chains and greedily packs independent
+    ops into cycles, respecting slot limits. Allocates physical addresses
+    inline — no separate allocation pass needed.
+
+    Returns (bundles, sched_meta) where bundles have physical addresses.
+    """
+    n = len(slots)
+    if n == 0:
+        return [], []
+
+    slot_defs, slot_uses, successors, predecessors, in_degree = build_dag(slots)
+    dist_to_load, dist_to_flow, dist_to_either = compute_distances(slots, predecessors)
+    remaining_uses = compute_use_counts(slot_uses)
+
+    # --- Metadata helpers (for tracing) ---
+
+    def op_desc(i):
+        engine, args = slots[i]
+        op_name = args[0] if args else ""
+        dest = ""
+        if len(args) > 1 and isinstance(args[1], VReg):
+            dest = args[1].name_hint or f"v{args[1].id}"
+        return f"{engine} {op_name} {dest}".strip()
+
+    def named_args(i):
+        engine, args = slots[i]
+        parts = [a.name_hint or f"v{a.id}" if isinstance(a, VReg) else a for a in args]
+        return f"({engine} {' '.join(str(x) for x in parts)})"
+
+    # --- Allocation helpers ---
 
     def resolve_parent(vreg):
         if hasattr(vreg, 'parent') and vreg.parent is not None:
@@ -356,9 +370,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     frees.append(pv)
         return frees
 
-    # Step 3: List scheduling with integrated allocation
-    # Active distance map — updated each cycle based on what's starved
-    active_dist = dist_to_either  # default
+    # --- Scheduling state ---
+
+    active_dist = dist_to_either
 
     def sched_key(i):
         return (active_dist[i], sort_key(i), i)
@@ -369,13 +383,11 @@ def schedule(slots, slot_limits, allocator, tags=None):
     partial_ops = {}
     stall_slot = 0
     stall_alloc = 0
-    flex_alu_on_alu = 0
-    flex_alu_on_flow = 0
 
     ready_cycle = {}
-    op_scheduled_cycle = {}  # op index -> cycle it was scheduled
-    op_to_id = {}  # op index -> unique op_id for flow events
-    next_op_id = [0]  # mutable counter
+    op_scheduled_cycle = {}
+    op_to_id = {}
+    next_op_id = [0]
     cycle_num = 0
     for i in ready:
         ready_cycle[i] = 0
@@ -387,22 +399,19 @@ def schedule(slots, slot_limits, allocator, tags=None):
         return op_to_id[i]
 
     def build_meta(i):
-        """Build scheduling metadata dict for op i."""
-        meta = {"ready": ready_cycle.get(i, 0), "sched": cycle_num, "deps": build_dep_info(i), "op_id": assign_op_id(i), "named": named_args(i), "pressure": sort_key(i), "dist_to_load": dist_to_load[i], "dist_to_flow": dist_to_flow[i]}
+        meta = {
+            "ready": ready_cycle.get(i, 0), "sched": cycle_num,
+            "op_id": assign_op_id(i), "named": named_args(i),
+            "pressure": sort_key(i),
+            "dist_to_load": dist_to_load[i], "dist_to_flow": dist_to_flow[i],
+            "deps": [{"op": op_desc(p), "cycle": op_scheduled_cycle.get(p, -1),
+                       "op_id": assign_op_id(p)} for p in predecessors[i]],
+        }
         if tags is not None and i < len(tags):
             meta.update(tags[i])
         return meta
 
-    def build_dep_info(i):
-        """Build dependency info for op i: list of {desc, sched_cycle, op_id} for each predecessor."""
-        deps = []
-        for pred in predecessors[i]:
-            deps.append({
-                "op": op_desc(pred),
-                "cycle": op_scheduled_cycle.get(pred, -1),
-                "op_id": assign_op_id(pred),
-            })
-        return deps
+    # --- Main scheduling loop ---
 
     while ready or partial_ops:
         bundle = []
@@ -412,7 +421,15 @@ def schedule(slots, slot_limits, allocator, tags=None):
         remaining = []
         pending_frees = []
 
-        # First: continue in-progress partial ops (priority)
+        def emit(slot_tuple, i):
+            """Append a slot to the bundle and mark op i as scheduled."""
+            bundle.append(slot_tuple)
+            bundle_meta.append(build_meta(i))
+            scheduled_this_cycle.append(i)
+            op_scheduled_cycle[i] = cycle_num
+            pending_frees.extend(consume_uses(i))
+
+        # Continue in-progress partial valu→alu promotions
         for i in list(partial_ops):
             alu_avail = available.get("alu", 0)
             if alu_avail <= 0:
@@ -430,7 +447,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 op_scheduled_cycle[i] = cycle_num
                 pending_frees.extend(consume_uses(i))
 
-        # Adapt distance heuristic based on what's starved in the ready queue
+        # Adapt priority heuristic: feed whichever bottleneck engine is starved
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
         load_starved = n_ready_loads < slot_limits.get("load", 2)
@@ -441,68 +458,15 @@ def schedule(slots, slot_limits, allocator, tags=None):
             active_dist = dist_to_flow
         else:
             active_dist = dist_to_either
-
         ready.sort(key=sched_key)
 
-        def commit_op(i, slot_engine, emit_engine=None):
-            """Commit op i. Consumes a slot from slot_engine's budget,
-            but emits as emit_engine in the bundle (defaults to slot_engine).
-            This distinction matters for flex_flow: may consume a valu slot
-            but must emit as 'flow' since vselect is a flow instruction."""
-            if emit_engine is None:
-                emit_engine = slot_engine
-            physical_args = allocator.rewrite_args(slots[i][1])
-            meta = build_meta(i)
-            bundle.append((emit_engine, physical_args))
-            bundle_meta.append(meta)
-            available[slot_engine] -= 1
-            scheduled_this_cycle.append(i)
-            op_scheduled_cycle[i] = cycle_num
-            pending_frees.extend(consume_uses(i))
-            return True
-
-        def commit_op_as_alu(i):
-            """Commit op i via valu→alu promotion. May be partial."""
-            alu_avail = available.get("alu", 0)
-            can_do = min(alu_avail, VLEN)
-            physical_args = allocator.rewrite_args(slots[i][1])
-            meta = build_meta(i)
-            bundle.append(("valu_as_alu", physical_args, 0, can_do))
-            bundle_meta.append(meta)
-            available["alu"] -= can_do
-            if can_do >= VLEN:
-                scheduled_this_cycle.append(i)
-                op_scheduled_cycle[i] = cycle_num
-                pending_frees.extend(consume_uses(i))
-            else:
-                partial_ops[i] = can_do
-                op_scheduled_cycle[i] = cycle_num
-
-        def commit_flex_alu_add(i, as_flow):
-            """Commit a flex_alu_add op as either alu or flow add_imm."""
-            physical_args = allocator.rewrite_args(slots[i][1])
-            meta = build_meta(i)
-            if as_flow:
-                # ("+", dest_phys, base_phys, const_phys, imm) -> ("add_imm", dest_phys, base_phys, imm)
-                flow_args = ("add_imm", physical_args[1], physical_args[2], physical_args[4])
-                bundle.append(("flow", flow_args))
-                available["flow"] -= 1
-            else:
-                # ("+", dest_phys, base_phys, const_phys, imm) -> ("+", dest_phys, base_phys, const_phys)
-                bundle.append(("alu", physical_args[:4]))
-                available["alu"] -= 1
-            bundle_meta.append(meta)
-            scheduled_this_cycle.append(i)
-            op_scheduled_cycle[i] = cycle_num
-            pending_frees.extend(consume_uses(i))
-
-        # Schedule new ready ops
+        # Schedule ready ops
         for i in ready:
             engine = slots[i][0]
 
             if engine == "flex_alu_add":
-                can_alu = available.get("alu", 0) > 0
-                if not can_alu:
+                # flex_alu_add: scalar add emitted as alu, args trimmed to drop imm
+                if available.get("alu", 0) <= 0:
                     remaining.append(i)
                     stall_slot += 1
                     continue
@@ -510,8 +474,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     remaining.append(i)
                     stall_alloc += 1
                     continue
-                commit_flex_alu_add(i, as_flow=False)
-                flex_alu_on_alu += 1
+                physical_args = allocator.rewrite_args(slots[i][1])
+                emit(("alu", physical_args[:4]), i)
+                available["alu"] -= 1
                 continue
 
             # Check engine availability
@@ -525,7 +490,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 stall_slot += 1
                 continue
 
-            # Try to allocate defs — if allocator says no room, defer
             if not try_alloc_defs(i):
                 remaining.append(i)
                 stall_alloc += 1
@@ -534,19 +498,31 @@ def schedule(slots, slot_limits, allocator, tags=None):
                     print(f"  alloc_fail cycle={cycle_num} op={op_desc(i)} usage={allocator.current_usage()} defs={defs_info}")
                 continue
 
-            # Commit
             if can_native:
-                commit_op(i, engine)
+                physical_args = allocator.rewrite_args(slots[i][1])
+                emit((engine, physical_args), i)
+                available[engine] -= 1
             else:
-                commit_op_as_alu(i)
+                # valu→alu promotion (may be partial if not enough alu slots)
+                alu_avail = available.get("alu", 0)
+                can_do = min(alu_avail, VLEN)
+                physical_args = allocator.rewrite_args(slots[i][1])
+                bundle.append(("valu_as_alu", physical_args, 0, can_do))
+                bundle_meta.append(build_meta(i))
+                available["alu"] -= can_do
+                op_scheduled_cycle[i] = cycle_num
+                if can_do >= VLEN:
+                    scheduled_this_cycle.append(i)
+                    pending_frees.extend(consume_uses(i))
+                else:
+                    partial_ops[i] = can_do
 
-        allocator.track_peak(cycle_num)  # snapshot BEFORE frees (true peak)
+        allocator.track_peak(cycle_num)
 
-        # End of cycle: free dead vregs
         for vreg in pending_frees:
             allocator.free(vreg)
 
-        # Newly ready ops
+        # Unblock successors of completed ops
         newly_ready = []
         for i in scheduled_this_cycle:
             for succ in successors[i]:
@@ -568,7 +544,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
             break
 
     print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
-    print(f"  flex_alu_add: on_alu={flex_alu_on_alu}, on_flow={flex_alu_on_flow}")
     return bundles, sched_meta
 
 
