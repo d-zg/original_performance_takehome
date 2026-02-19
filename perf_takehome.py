@@ -749,9 +749,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
         # Adaptive starvation: bias remaining-preds metric toward starved resource
         n_ready_loads = sum(1 for i in ready if slots[i][0] == "load")
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
-        load_starved = n_ready_loads < 6
+        load_starved = n_ready_loads < 8
         flow_starved = n_ready_flows < slot_limits.get("flow", 1) and not load_starved
-        if n_ready_loads > 17 or flow_starved:
+        if n_ready_loads > 20 or flow_starved:
             active_metric = "flow"
         else:
             active_metric = "load"
@@ -812,9 +812,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
             if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
                 remaining.append(i)
                 stall_alloc += 1
-                # if stall_alloc <= 5:
-                #     defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
-                #     print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
+                if stall_alloc <= 5:
+                    defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
+                    print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
                 continue
 
             if can_native:
@@ -1511,6 +1511,35 @@ class KernelBuilder:
 
         return slots, remaining_vregs[0]
 
+    def build_mux_select_from_parities(self, broadcast_vregs, parities, k, index):
+        """Select node values using stored parity vectors directly (no bit extraction).
+
+        parities is a list of parity vectors [p0, p1, ..., p_{k-1}] where p0 is
+        the oldest (from the round that went to k=0). The mux stage ordering needs
+        bit 0 (most recent = p_{k-1}) first, then bit 1 (= p_{k-2}), etc.
+
+        Returns (slots, result_vreg). No VALU ops — only flow (vselect).
+        """
+        slots = []
+        remaining_vregs = list(broadcast_vregs)
+        if k == 0:
+            return slots, broadcast_vregs[0]
+
+        for stage in range(k):
+            # Stage s needs bit s of idx. bit 0 = most recent parity = parities[k-1],
+            # bit 1 = parities[k-2], etc.
+            condition_vreg = parities[k - 1 - stage]
+            next_vregs = []
+            for i in range(max(len(remaining_vregs) // 2, 1)):
+                next_vreg = remaining_vregs.pop(0)
+                adjacent_vreg = remaining_vregs.pop(0)
+                result_vreg = self.new_vreg_vec(f"mux_stage{stage}_vec{index}_{i}")
+                slots.append(("flow", ("vselect", result_vreg, condition_vreg, adjacent_vreg, next_vreg)))
+                next_vregs.append(result_vreg)
+            remaining_vregs = next_vregs
+
+        return slots, remaining_vregs[0]
+
     def build_gather(self, addr_vec, name_hint="gather"):
         """Gather VLEN values from non-contiguous addresses into a vector.
         Returns (slots, dest_vreg) where dest_vreg is the result."""
@@ -1532,6 +1561,7 @@ class KernelBuilder:
         six_const = self.scratch_const(6)
         eight_const = self.new_vreg("eight_const")
         sixteen_const = self.new_vreg("sixteen_const")
+        thirty_two_const = self.new_vreg("thirty_two_const")
 
         # Param vregs (mem loads emitted in build_kernel after ALU chain defines addresses)
         # Memory header: [rounds=0, n_nodes=1, batch_size=2, forest_height=3,
@@ -1545,7 +1575,7 @@ class KernelBuilder:
             self.scratch_const(val1)
             self.scratch_const(val3)
 
-        return one_const, two_const, four_const, six_const, eight_const, sixteen_const, param_vregs
+        return one_const, two_const, four_const, six_const, eight_const, sixteen_const, thirty_two_const, param_vregs
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
@@ -1556,7 +1586,7 @@ class KernelBuilder:
         Each write creates a fresh vreg (SSA form).
         """
         # Setup phase: allocate scratch and register constants
-        one_const, two_const, four_const, six_const, eight_const, sixteen_const, param_vregs = self.setup_kernel_scratch_and_constants()
+        one_const, two_const, four_const, six_const, eight_const, sixteen_const, thirty_two_const, param_vregs = self.setup_kernel_scratch_and_constants()
 
         # Emit pause immediately (no-op sync point for reference_kernel2)
         self.add("flow", ("pause",))
@@ -1572,11 +1602,12 @@ class KernelBuilder:
             for s in slots:
                 emit(s, vi, rnd)
 
-        # Derive 2, 4, 8, 16 via ALU doubling chain
+        # Derive 2, 4, 8, 16, 32 via ALU doubling chain
         emit(("alu", ("+", two_const, one_const, one_const)))
         emit(("alu", ("+", four_const, two_const, two_const)))
         emit(("alu", ("+", eight_const, four_const, four_const)))
         emit(("alu", ("+", sixteen_const, eight_const, eight_const)))
+        emit(("alu", ("+", thirty_two_const, sixteen_const, sixteen_const)))
 
         # Param mem loads
         emit(("load", ("load", param_vregs["forest_values_p"], four_const)))
@@ -1586,10 +1617,16 @@ class KernelBuilder:
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
         four_vec = self.pinned_vreg("four_vec", VLEN)
+        eight_vec = self.pinned_vreg("eight_vec", VLEN)
+        sixteen_vec = self.pinned_vreg("sixteen_vec", VLEN)
+        thirty_two_vec = self.pinned_vreg("thirty_two_vec", VLEN)
 
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", four_vec, four_const)))
+        emit(("valu", ("vbroadcast", eight_vec, eight_const)))
+        emit(("valu", ("vbroadcast", sixteen_vec, sixteen_const)))
+        emit(("valu", ("vbroadcast", thirty_two_vec, thirty_two_const)))
         # 1-based indexing: gather uses (forest_p - 1) + idx'
         # Scalar subtract then broadcast (2 ops instead of 3)
         minus_one_const = self.scratch_const(0xFFFFFFFF)  # -1 mod 2^32
@@ -1644,6 +1681,8 @@ class KernelBuilder:
 
         # Main loop: all rounds, reading/writing scratch VRegs (no memory round-trip)
         cached_broadcasts = {}
+        # Parity history: per-vector list of parity vregs for deferred idx
+        parity_history = [[] for _ in range(n_vectors)]
         for rnd in range(rounds):
             new_idx_vecs = []
             new_val_vecs = []
@@ -1652,33 +1691,47 @@ class KernelBuilder:
             # Tag as prev flight (rnd-1) so it's part of the previous flight.
             setup_rnd = rnd - 1 if rnd > 0 else -1
 
-            if k <= 3:
-                if k in cached_broadcasts:
-                    broadcast_vregs = cached_broadcasts[k]
-                else:
-                    preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
-                    emit_all(preload_slots, rnd=setup_rnd)
-                    cached_broadcasts[k] = broadcast_vregs
+            # Tunable: how many vectors use mux vs gather at each level
+            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 9}
+            n_mux = mux_count.get(k, 0)
 
-            # Optimal mux/gather split: balance flow (mux) vs load (gather)
-            # m = 4n / (2^k + 3), rounded to nearest int
-            mux_count = {0: n_vectors, 1: n_vectors, 2: n_vectors, 3: n_vectors, 4: 0}
+            if n_mux > 0 and k not in cached_broadcasts:
+                preload_slots, broadcast_vregs = self.preload_level(k, param_vregs["forest_values_p"])
+                emit_all(preload_slots, rnd=setup_rnd)
+                cached_broadcasts[k] = broadcast_vregs
+            if k in cached_broadcasts:
+                broadcast_vregs = cached_broadcasts[k]
 
             for vi in range(n_vectors):
-                idx_loaded = idx_vecs[vi]
                 val_loaded = val_vecs[vi]
 
-                # Compute gather addresses: addr = forest_p + idx
-                if k <= 3 and vi < mux_count.get(k, 0):
-                    select_slots, node_val = self.build_mux_select(broadcast_vregs, idx_loaded, k, vi)
+                # Node lookup: mux or gather
+                if vi < n_mux:
+                    # Mux path: use stored parities directly as vselect conditions
+                    select_slots, node_val = self.build_mux_select_from_parities(
+                        broadcast_vregs, parity_history[vi], k, vi)
                     emit_all(select_slots, vi=vi, rnd=setup_rnd)
-
                 else:
-                    addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
-                    # 1-based: addr = (forest_p - 1) + idx'
-                    emit(("valu", ("+", addr_vec, forest_p_m1_final, idx_loaded)), vi=vi, rnd=setup_rnd)
+                    # Gather path: need materialized idx
+                    idx_loaded = idx_vecs[vi]
+                    if idx_loaded is None:
+                        # idx not materialized yet — reconstruct from parities
+                        p_list = parity_history[vi]
+                        n_p = len(p_list)
+                        # idx = 2^n_p + sum(p_i * 2^(n_p - 1 - i))
+                        # Build via multiply_add chain
+                        acc = p_list[0]
+                        for pi in range(1, n_p):
+                            tmp = self.new_vreg_vec(f"recon_t{pi}_r{rnd}_v{vi}")
+                            emit(("valu", ("multiply_add", tmp, acc, two_vec, p_list[pi])), vi=vi, rnd=setup_rnd)
+                            acc = tmp
+                        # Add 2^n_p offset
+                        level_offset_vecs = {1: two_vec, 2: four_vec, 3: eight_vec, 4: sixteen_vec, 5: thirty_two_vec}
+                        idx_loaded = self.new_vreg_vec(f"idx_recon_r{rnd}_v{vi}")
+                        emit(("valu", ("+", idx_loaded, acc, level_offset_vecs[n_p])), vi=vi, rnd=setup_rnd)
 
-                    # Gather node values from tree (still from main memory)
+                    addr_vec = self.new_vreg_vec(f"addr_r{rnd}_v{vi}")
+                    emit(("valu", ("+", addr_vec, forest_p_m1_final, idx_loaded)), vi=vi, rnd=setup_rnd)
                     gather_slots, node_val = self.build_gather(addr_vec, f"node_r{rnd}_v{vi}")
                     emit_all(gather_slots, vi=vi, rnd=setup_rnd)
 
@@ -1691,14 +1744,40 @@ class KernelBuilder:
                 emit_all(hash_slots, vi=vi, rnd=rnd)
 
                 if rnd < rounds - 1:
+                    next_k = (rnd + 1) % (forest_height + 1)
+                    next_is_mux = vi < mux_count.get(next_k, 0)
                     if k == forest_height:
                         # At leaves: idx wraps to root. 1-based root = 1
                         new_idx_vecs.append(one_vec)
+                        parity_history[vi] = []
+                    elif next_is_mux:
+                        # Next round uses mux for this vector: just store parity
+                        parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
+                        emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
+                        parity_history[vi].append(parity)
+                        new_idx_vecs.append(None)  # idx not materialized
+                    elif parity_history[vi]:
+                        # Next round uses gather but we have stored parities: reconstruct
+                        parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
+                        emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
+                        parity_history[vi].append(parity)
+                        p_list = parity_history[vi]
+                        n_p = len(p_list)
+                        acc = p_list[0]
+                        for pi in range(1, n_p):
+                            tmp = self.new_vreg_vec(f"recon_t{pi}_r{rnd}_v{vi}")
+                            emit(("valu", ("multiply_add", tmp, acc, two_vec, p_list[pi])), vi=vi, rnd=rnd)
+                            acc = tmp
+                        level_offset_vecs = {1: two_vec, 2: four_vec, 3: eight_vec, 4: sixteen_vec, 5: thirty_two_vec}
+                        idx_recon = self.new_vreg_vec(f"idx_recon_r{rnd}_v{vi}")
+                        emit(("valu", ("+", idx_recon, acc, level_offset_vecs[n_p])), vi=vi, rnd=rnd)
+                        parity_history[vi] = []
+                        new_idx_vecs.append(idx_recon)
                     else:
-                        # 1-based: idx_next' = 2*idx' + parity (2 ops instead of 3)
+                        # Normal incremental idx update (2 ops)
+                        idx_loaded = idx_vecs[vi]
                         parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
                         idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
-
                         emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
                         emit(("valu", ("multiply_add", idx_next, idx_loaded, two_vec, parity)), vi=vi, rnd=rnd)
                         new_idx_vecs.append(idx_next)
@@ -1722,7 +1801,7 @@ class KernelBuilder:
         # Schedule + allocate in one pass
         allocator = ScratchAllocator(self.scratch_ptr, scratch_debug=self.scratch_debug)
         bundles, sched_meta = schedule(body, slot_limits or dict(SLOT_LIMITS), allocator, tags=body_tags)
-        # allocator.print_peak_info()
+        allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
 
         # Extract per-(vi, rnd) timing and per-op stats from sched_meta
