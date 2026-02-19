@@ -15,7 +15,7 @@ After the easy win of vectorizing the kernel, gathering node values for each vec
 
 ### 1. Reducing operation count
 
-Most of these were discovered by doing detailed operation-by-operation walkthroughs of the hot loop and repeatedly asking Claude "why are we doing this?" about each step.
+Most of these were discovered by doing detailed operation-by-operation walkthroughs of particular areas and repeatedly asking Claude "why are we doing this?" about each step.
 
 - **multiply_add fusion**: `(a + const) + (a << N)` collapses to a single `multiply_add(a, 2^N+1, const)`. Applied to the hash function (6 stages, 3 ops each -> 1 op for fusable stages) and index updates.
 - **1-based tree indexing**: The index update `idx = 2*idx + 1 + (val & 1)` becomes `idx' = 2*idx' + parity` saving one VALU op per vector per round by making the +1 implicit. We pay a minor setup cost (computing `forest_values_p - 1` and broadcasting it for gather addressing) but save one op per vector per non-leaf round.
@@ -45,6 +45,9 @@ The scheduler evolved through several heuristic iterations, guided by examining 
 - **Remaining-predecessors momentum**: The final heuristic uses the count of unscheduled predecessors feeding each bottleneck op. As ops get scheduled, the count drops, creating momentum toward finishing groups rather than spreading work thin. It also adaptively biases toward loads vs. flows based on how many of each are currently ready: early rounds (k=0-3) use mux trees which produce vselects (flow ops) but few loads, so we bias toward feeding the scarce loads to keep them saturated. Later rounds (k=4+) are all gathers, flooding the ready queue with loads, so we shift bias toward feeding flow ops instead.
 
 The scheduler isn't optimal, but it is kind of parametric and tweakable. The scheduling heuristics and the mux/gather split ratios are both controlled by a handful of numeric parameters (starvation thresholds, mux_count per level, etc.) that can be grid-searched cheaply after each structural optimization. This meant I could make a code-level change (e.g., adding deferred parity, extending mux to k=4) and then quickly sweep the parameter space to find the new sweet spot. 
+
+<img width="920" height="390" alt="image" src="https://github.com/user-attachments/assets/3e0488a0-d451-4d82-8920-10163dd24618" />
+
 
 ### 3. Mux trees vs. gathers
 
