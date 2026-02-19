@@ -535,8 +535,8 @@ def update_vector_rounds(scheduled_this_cycle, vec, cycle_num):
             vec.vi_rnd_start_cycle[key] = cycle_num
         vec.scheduled_per_vi_rnd[key] += 1
         if vec.scheduled_per_vi_rnd[key] >= vec.total_ops_per_vi_rnd[key]:
-            start_c = vec.vi_rnd_start_cycle.get(key, -1)
-            print(f"  (vi={vi_s}, rnd={rnd_s}) done cycle={cycle_num} (started={start_c}, dur={cycle_num - start_c})")
+            # start_c = vec.vi_rnd_start_cycle.get(key, -1)
+            # print(f"  (vi={vi_s}, rnd={rnd_s}) done cycle={cycle_num} (started={start_c}, dur={cycle_num - start_c})")
             next_rounds = sorted(
                 r for r in vec.vi_rounds[vi_s]
                 if vec.scheduled_per_vi_rnd[(vi_s, r)] < vec.total_ops_per_vi_rnd.get((vi_s, r), 0)
@@ -810,9 +810,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
             if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
                 remaining.append(i)
                 stall_alloc += 1
-                if stall_alloc <= 5:
-                    defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
-                    print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
+                # if stall_alloc <= 5:
+                #     defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
+                #     print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
                 continue
 
             if can_native:
@@ -884,10 +884,10 @@ def schedule(slots, slot_limits, allocator, tags=None):
                                active_metric)
             break
 
-    print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
-    if vec.has_vectors:
-        print(f"  Active set: max={vec.max_active}")
-        print(f"  Vectors: {len(vec.all_vectors)} total, {len(vec.inactive_queue)} remaining inactive")
+    # print(f"Scheduler: {cycle_num} cycles, {n} ops, stalls: slot_full={stall_slot}, alloc_fail={stall_alloc}")
+    # if vec.has_vectors:
+    #     print(f"  Active set: max={vec.max_active}")
+    #     print(f"  Vectors: {len(vec.all_vectors)} total, {len(vec.inactive_queue)} remaining inactive")
     return bundles, sched_meta
 
 
@@ -1719,7 +1719,7 @@ class KernelBuilder:
         # Schedule + allocate in one pass
         allocator = ScratchAllocator(self.scratch_ptr, scratch_debug=self.scratch_debug)
         bundles, sched_meta = schedule(body, slot_limits or dict(SLOT_LIMITS), allocator, tags=body_tags)
-        allocator.print_peak_info()
+        # allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
 
         # Extract per-(vi, rnd) timing and per-op stats from sched_meta
