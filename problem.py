@@ -39,8 +39,6 @@ class DebugInfo:
 
     # Maps scratch variable addr to (name, len) pair
     scratch_map: dict[int, (str, int)]
-    # Maps (pc, engine, slot_index) to scheduling metadata dict
-    slot_sched_info: dict[tuple, dict] = None
 
 
 def cdiv(a, b):
@@ -347,56 +345,8 @@ class Machine:
                 )
 
     def trace_slot(self, core, slot, name, i):
-        sched_str = ""
-        named_str = str(self.rewrite_slot(slot))  # fallback
-        if self.debug_info.slot_sched_info is not None:
-            key = (core.pc - 1, name, i)
-            info = self.debug_info.slot_sched_info.get(key)
-            if info:
-                # Use vreg names captured at scheduling time (correct despite address reuse)
-                if "named" in info:
-                    named_str = info["named"]
-                delay = info["sched"] - info["ready"]
-                pressure = info.get("pressure", "")
-                pressure_str = f', "pressure": {pressure}' if pressure != "" else ""
-                vi = info.get("vi", "")
-                vi_str = f', "vi": {vi}' if vi != "" else ""
-                rnd = info.get("rnd", "")
-                rnd_str = f', "rnd": {rnd}' if rnd != "" else ""
-                dtl = info.get("dist_to_load", "")
-                dtl_str = f', "dist_to_load": {dtl}' if dtl != "" else ""
-                sched_str = f', "ready_cycle": {info["ready"]}, "sched_cycle": {info["sched"]}, "delay": {delay}{pressure_str}{vi_str}{rnd_str}{dtl_str}'
-                deps = info.get("deps", [])
-                if deps:
-                    # Format: "op1@cycle1, op2@cycle2" — show blocking dep (latest) first
-                    dep_strs = sorted(deps, key=lambda d: -d["cycle"])
-                    deps_fmt = "; ".join(f'{d["op"]}@{d["cycle"]}' for d in dep_strs)
-                    deps_fmt = deps_fmt.replace('"', '\\"')
-                    sched_str += f', "deps": "{deps_fmt}"'
-                    if dep_strs:
-                        blocker = dep_strs[0]
-                        blocker_str = f'{blocker["op"]}@{blocker["cycle"]}'.replace('"', '\\"')
-                        sched_str += f', "blocked_by": "{blocker_str}"'
-                # Record trace coordinates for flow events
-                op_id = info.get("op_id")
-                if op_id is not None:
-                    tid = self.tids[(core.id, name, i)]
-                    if not hasattr(self, '_op_coords'):
-                        self._op_coords = {}
-                    # Only record first occurrence (for expanded valu_as_alu)
-                    if op_id not in self._op_coords:
-                        self._op_coords[op_id] = (core.id, tid, self.cycle)
-                    # Record dep edges for flow event emission
-                    if not hasattr(self, '_dep_edges'):
-                        self._dep_edges = []
-                    for dep in deps:
-                        dep_op_id = dep.get("op_id")
-                        if dep_op_id is not None:
-                            self._dep_edges.append((dep_op_id, op_id))
-        # Escape any quotes in named_str for JSON safety
-        named_str = str(named_str).replace('"', '\\"')
         self.trace.write(
-            f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{named_str}"{sched_str} }} }},\n'
+            f'{{"name": "{slot[0]}", "cat": "op", "ph": "X", "pid": {core.id}, "tid": {self.tids[(core.id, name, i)]}, "ts": {self.cycle}, "dur": 1, "args":{{"slot": "{str(slot)}", "named": "{str(self.rewrite_slot(slot))}" }} }},\n'
         )
 
     def step(self, instr: Instruction, core):
@@ -448,26 +398,6 @@ class Machine:
 
     def __del__(self):
         if self.trace is not None:
-            # Emit flow events for dependency arrows
-            op_coords = getattr(self, '_op_coords', {})
-            dep_edges = getattr(self, '_dep_edges', {})
-            seen_edges = set()
-            flow_id = 0
-            for from_id, to_id in dep_edges:
-                edge = (from_id, to_id)
-                if edge in seen_edges:
-                    continue
-                seen_edges.add(edge)
-                if from_id in op_coords and to_id in op_coords:
-                    f_pid, f_tid, f_ts = op_coords[from_id]
-                    t_pid, t_tid, t_ts = op_coords[to_id]
-                    self.trace.write(
-                        f'{{"name": "dep", "cat": "dep", "ph": "s", "pid": {f_pid}, "tid": {f_tid}, "ts": {f_ts}, "id": {flow_id}}},\n'
-                    )
-                    self.trace.write(
-                        f'{{"name": "dep", "cat": "dep", "ph": "f", "pid": {t_pid}, "tid": {t_tid}, "ts": {t_ts}, "id": {flow_id}, "bp": "e"}},\n'
-                    )
-                    flow_id += 1
             self.trace.write("]")
             self.trace.close()
 
