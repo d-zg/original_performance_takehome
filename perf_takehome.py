@@ -594,6 +594,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
 
     slot_defs, slot_uses, successors, predecessors, in_degree = build_dag(slots)
     dist_to_load, dist_to_flow, dist_to_either, target_load, target_flow = compute_distances(slots, predecessors)
+
     alloc_state = AllocState(
         allocator=allocator,
         remaining_uses=compute_use_counts(slot_uses),
@@ -616,6 +617,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
             remaining_to_flow[target_flow[i]] += 1
 
     active_metric = ""
+    cycle_num = 0
 
     def sched_key(i):
         if active_metric == "load":
@@ -633,6 +635,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         return (r, d, alloc_sort_key(i, slot_defs, slot_uses, alloc_state), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
+
     bundles = []
     sched_meta = []
     partial_ops = {}
@@ -643,7 +646,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
     op_scheduled_cycle = {}
     op_to_id = {}
     next_op_id = [0]
-    cycle_num = 0
     for i in ready:
         ready_cycle[i] = 0
 
@@ -749,7 +751,7 @@ def schedule(slots, slot_limits, allocator, tags=None):
         n_ready_flows = sum(1 for i in ready if slots[i][0] == "flow")
         load_starved = n_ready_loads < 6
         flow_starved = n_ready_flows < slot_limits.get("flow", 1) and not load_starved
-        if n_ready_loads > 12 or flow_starved:
+        if n_ready_loads > 17 or flow_starved:
             active_metric = "flow"
         else:
             active_metric = "load"
@@ -1522,14 +1524,14 @@ class KernelBuilder:
         """Allocate scratch space, load kernel parameters, and register constants.
 
         Returns (one_const, two_const, four_const, eight_const, param_vregs).
-        Derived constants (2, 4, 6, 8) are vregs defined by ALU ops in build_kernel.
         """
-        # Only const-load 1 as fundamental; 2, 4, 6, 8 computed via ALU doubling
+        # Load 1 as fundamental; 2, 4, 8, 16 derived via ALU doubling
         one_const = self.scratch_const(1)
         two_const = self.new_vreg("two_const")
         four_const = self.new_vreg("four_const")
-        six_const = self.new_vreg("six_const")
+        six_const = self.scratch_const(6)
         eight_const = self.new_vreg("eight_const")
+        sixteen_const = self.new_vreg("sixteen_const")
 
         # Param vregs (mem loads emitted in build_kernel after ALU chain defines addresses)
         # Memory header: [rounds=0, n_nodes=1, batch_size=2, forest_height=3,
@@ -1543,7 +1545,7 @@ class KernelBuilder:
             self.scratch_const(val1)
             self.scratch_const(val3)
 
-        return one_const, two_const, four_const, six_const, eight_const, param_vregs
+        return one_const, two_const, four_const, six_const, eight_const, sixteen_const, param_vregs
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
@@ -1554,7 +1556,7 @@ class KernelBuilder:
         Each write creates a fresh vreg (SSA form).
         """
         # Setup phase: allocate scratch and register constants
-        one_const, two_const, four_const, six_const, eight_const, param_vregs = self.setup_kernel_scratch_and_constants()
+        one_const, two_const, four_const, six_const, eight_const, sixteen_const, param_vregs = self.setup_kernel_scratch_and_constants()
 
         # Emit pause immediately (no-op sync point for reference_kernel2)
         self.add("flow", ("pause",))
@@ -1570,13 +1572,13 @@ class KernelBuilder:
             for s in slots:
                 emit(s, vi, rnd)
 
-        # Compute derived constants via ALU doubling chain (saves 4 const loads)
+        # Derive 2, 4, 8, 16 via ALU doubling chain
         emit(("alu", ("+", two_const, one_const, one_const)))
         emit(("alu", ("+", four_const, two_const, two_const)))
-        emit(("alu", ("+", six_const, four_const, two_const)))
         emit(("alu", ("+", eight_const, four_const, four_const)))
+        emit(("alu", ("+", sixteen_const, eight_const, eight_const)))
 
-        # Param mem loads (emitted here so DAG sees ALU-computed address deps)
+        # Param mem loads
         emit(("load", ("load", param_vregs["forest_values_p"], four_const)))
         emit(("load", ("load", param_vregs["inp_values_p"], six_const)))
 
@@ -1584,12 +1586,10 @@ class KernelBuilder:
         one_vec = self.pinned_vreg("one_vec", VLEN)
         two_vec = self.pinned_vreg("two_vec", VLEN)
         four_vec = self.pinned_vreg("four_vec", VLEN)
-        eight_vec = self.pinned_vreg("eight_vec", VLEN)
 
         emit(("valu", ("vbroadcast", one_vec, one_const)))
         emit(("valu", ("vbroadcast", two_vec, two_const)))
         emit(("valu", ("vbroadcast", four_vec, four_const)))
-        emit(("valu", ("vbroadcast", eight_vec, eight_const)))
         # 1-based indexing: gather uses (forest_p - 1) + idx'
         # Scalar subtract then broadcast (2 ops instead of 3)
         minus_one_const = self.scratch_const(0xFFFFFFFF)  # -1 mod 2^32
@@ -1598,17 +1598,22 @@ class KernelBuilder:
         emit(("flex_alu_add", ("+", forest_p_m1_scalar, param_vregs["forest_values_p"], minus_one_const, 0xFFFFFFFF)))
         emit(("valu", ("vbroadcast", forest_p_m1_final, forest_p_m1_scalar)))
 
-        # Pre-broadcast all 12 hash constants (pinned since used every iteration)
+        # Pre-broadcast hash constants (pinned since used every iteration)
+        # Deduplicate: if two stages broadcast the same value, share the vector
         hash_const_vecs = []
+        broadcast_vec_cache = {}  # broadcast_value -> pinned vreg
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
             const1_vec = self.pinned_vreg(f"hash_c1_{hi}_vec", VLEN)
-            const3_vec = self.pinned_vreg(f"hash_c3_{hi}_vec", VLEN)
             emit(("valu", ("vbroadcast", const1_vec, self.scratch_const(val1))))
-            if op1 == "+" and op2 == "+" and op3 == "<<":
-                # For fusable stages, const3 becomes the multiplier 2^N + 1
-                emit(("valu", ("vbroadcast", const3_vec, self.scratch_const((1 << val3) + 1))))
+
+            bcast_val = (1 << val3) + 1 if (op1 == "+" and op2 == "+" and op3 == "<<") else val3
+            if bcast_val in broadcast_vec_cache:
+                const3_vec = broadcast_vec_cache[bcast_val]
             else:
-                emit(("valu", ("vbroadcast", const3_vec, self.scratch_const(val3))))
+                const3_vec = self.pinned_vreg(f"hash_c3_{hi}_vec", VLEN)
+                emit(("valu", ("vbroadcast", const3_vec, self.scratch_const(bcast_val))))
+                broadcast_vec_cache[bcast_val] = const3_vec
+
             hash_const_vecs.append(const1_vec)
             hash_const_vecs.append(const3_vec)
 
@@ -1618,9 +1623,6 @@ class KernelBuilder:
         idx_vecs = [one_vec] * n_vectors
 
         # Compute val_bases incrementally using stride-2 ALU chain
-        sixteen_const = self.new_vreg("sixteen_const")
-        emit(("alu", ("+", sixteen_const, eight_const, eight_const)))
-
         val_bases = []
         for vi in range(n_vectors):
             if vi == 0:
@@ -1688,17 +1690,18 @@ class KernelBuilder:
                 hash_slots, val_hashed = self.build_vhash(val_xored, hash_const_vecs)
                 emit_all(hash_slots, vi=vi, rnd=rnd)
 
-                if k == forest_height:
-                    # At leaves: idx wraps to root. 1-based root = 1
-                    new_idx_vecs.append(one_vec)
-                else:
-                    # 1-based: idx_next' = 2*idx' + parity (2 ops instead of 3)
-                    parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
-                    idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
+                if rnd < rounds - 1:
+                    if k == forest_height:
+                        # At leaves: idx wraps to root. 1-based root = 1
+                        new_idx_vecs.append(one_vec)
+                    else:
+                        # 1-based: idx_next' = 2*idx' + parity (2 ops instead of 3)
+                        parity = self.new_vreg_vec(f"parity_r{rnd}_v{vi}")
+                        idx_next = self.new_vreg_vec(f"idx_next_r{rnd}_v{vi}")
 
-                    emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
-                    emit(("valu", ("multiply_add", idx_next, idx_loaded, two_vec, parity)), vi=vi, rnd=rnd)
-                    new_idx_vecs.append(idx_next)
+                        emit(("valu", ("&", parity, val_hashed, one_vec)), vi=vi, rnd=rnd)
+                        emit(("valu", ("multiply_add", idx_next, idx_loaded, two_vec, parity)), vi=vi, rnd=rnd)
+                        new_idx_vecs.append(idx_next)
 
                 new_val_vecs.append(val_hashed)
 

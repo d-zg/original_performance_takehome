@@ -1,6 +1,6 @@
 # Approach
 
-**Result**: 1,123 cycles (131.5x speedup over 147,734 baseline), 9/9 submission tests passing.
+**Result**: 1,118 cycles (131.5x speedup over 147,734 baseline), 9/9 submission tests passing.
 
 ## Infrastructure
 
@@ -15,7 +15,7 @@ After the easy win of vectorizing the kernel, gathering node values for each vec
 
 ### 1. Reducing operation count
 
-The biggest wins came from carefully examining every operation and asking "is this necessary?"
+Most of these were discovered by doing detailed operation-by-operation walkthroughs of the hot loop and repeatedly asking Claude "why are we doing this?" about each step.
 
 - **multiply_add fusion**: `(a + const) + (a << N)` collapses to a single `multiply_add(a, 2^N+1, const)`. Applied to the hash function (6 stages, 3 ops each -> 1 op for fusable stages) and index updates.
 - **1-based tree indexing**: The index update `idx = 2*idx + 1 + (val & 1)` becomes `idx' = 2*idx' + parity` saving one VALU op per vector per round by making the +1 implicit. We pay a minor setup cost (computing `forest_values_p - 1` and broadcasting it for gather addressing) but save one op per vector per non-leaf round.
@@ -25,7 +25,6 @@ The biggest wins came from carefully examining every operation and asking "is th
 - **Eliminating memory round-trips**: The baseline loads indices and values from memory every round and stores them back. Instead, keep them in scratch vregs across all 16 rounds — load once at the start, store once at the end. This required rewriting the ops to chain vregs between rounds rather than going through memory. Same idea for hash constants, broadcast vectors, and mux tree node values — anything shared across rounds gets computed once and reused.
 - **Setup/teardown trimming**: Derive constants via ALU doubling (2=1+1, 4=2+2, etc.) instead of const-loads. Skip loading indices (all start at 0). Skip storing indices (submission only checks values). Load only the 2 parameters actually needed.
 
-Most of these were discovered by doing detailed operation-by-operation walkthroughs of the hot loop and repeatedly asking Claude "why are we doing this?" about each step.
 
 **Increasing engine utilization**: Even without reducing total ops, we can get more done per cycle by using underutilized engines. ALU (12 slots/cycle) and flow (1 slot/cycle) are less pressured than VALU (6 slots/cycle) and load (2 slots/cycle), so moving work onto them is free throughput:
 
