@@ -630,7 +630,6 @@ def schedule(slots, slot_limits, allocator, tags=None):
                 remaining_to_load.get(target_load[i], n),
                 remaining_to_flow.get(target_flow[i], n),
             )
-        rnd = vec.op_rnd[i] if active_metric == "load" else 0
         return (r, d, alloc_sort_key(i, slot_defs, slot_uses, alloc_state), i)
 
     ready = sorted([i for i in range(n) if in_degree[i] == 0], key=sched_key)
@@ -929,13 +928,11 @@ def expand_valu_as_alu(bundles, sched_meta=None):
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
-        self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
         self.vregs = {}  # name -> VReg for named vregs
         self.pending_const_loads = []  # ("const", addr, val) tuples to batch-emit
-        self.pending_mem_loads = []    # ("load", dest, src) tuples to batch-emit
 
     @staticmethod
     def _extract_timing(sched_meta):
@@ -1201,11 +1198,6 @@ class KernelBuilder:
                   or sched_valu[c][vi] > 0 or sched_load[c][vi] > 0 or sched_flow[c][vi] > 0)
                   for c in cycles]
 
-        # Aggregate: per cycle, how many vectors had ops scheduled by type
-        n_did_valu = [sum(1 for vi in range(n_vectors) if sched_valu[c][vi] > 0) for c in cycles]
-        n_did_load = [sum(1 for vi in range(n_vectors) if sched_load[c][vi] > 0) for c in cycles]
-        n_did_flow = [sum(1 for vi in range(n_vectors) if sched_flow[c][vi] > 0) for c in cycles]
-
         fig3, (ax_avail, ax_sched) = plt.subplots(2, 1, figsize=(16, 8), sharex=True)
 
         # Top: how many vectors have each type available
@@ -1381,7 +1373,6 @@ class KernelBuilder:
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
         if name is not None:
-            self.scratch[name] = addr
             self.scratch_debug[addr] = (name, length)
         self.scratch_ptr += length
         if self.scratch_ptr > SCRATCH_SIZE:
@@ -1501,7 +1492,6 @@ class KernelBuilder:
             slots.append(("flow", ("vselect", result, bit, broadcast_vregs[1], broadcast_vregs[0])))
             return slots, result
 
-        # 1-based: level k starts at 2^k, so low k bits of idx' give position directly.
         bit_source = idx_vreg
 
         for stage in range(k):
@@ -1720,10 +1710,9 @@ class KernelBuilder:
             emit(("store", ("vstore", val_bases[vi], val_vecs[vi])), vi=vi, rnd=rounds)
 
         # Prepend all setup loads to body for scheduling
-        setup_slots = self.pending_const_loads + self.pending_mem_loads
+        setup_slots = list(self.pending_const_loads)
         setup_tags = [{"vi": -1, "rnd": -1}] * len(setup_slots)
         self.pending_const_loads.clear()
-        self.pending_mem_loads.clear()
         body = setup_slots + body
         body_tags = setup_tags + body_tags
 
@@ -1737,13 +1726,7 @@ class KernelBuilder:
         self.vi_rnd_timing, self._op_stats = self._extract_timing(sched_meta)
         self._bundles_for_stats = physical_bundles
 
-        body_instrs, slot_sched_info = self.build(physical_bundles, sched_meta)
-
-        # Remap sched_info keys: bundle_idx -> actual PC (offset by existing instrs)
-        pc_offset = len(self.instrs)
-        self.slot_sched_info = {}
-        for (bi, engine, si), meta in slot_sched_info.items():
-            self.slot_sched_info[(pc_offset + bi, engine, si)] = meta
+        body_instrs, _ = self.build(physical_bundles, sched_meta)
 
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
