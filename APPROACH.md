@@ -1,6 +1,6 @@
 # Approach
 
-**Result**: 1,118 cycles (131.5x speedup over 147,734 baseline), 9/9 submission tests passing.
+**Result**: 1,060 cycles (139.4x speedup over 147,734 baseline), 9/9 submission tests passing.
 
 ## Infrastructure
 
@@ -22,6 +22,7 @@ Most of these were discovered by doing detailed operation-by-operation walkthrou
 - **Eliminating bounds checks**: Since forest_height is known at compile time, we know exactly which round a walker reaches the leaves. No runtime comparison needed.
 - **No recomputation on wrap-around**: At leaf rounds, indices reset to 1 (the root in 1-based indexing) with zero ops, just reuse the constant vector.
 - **Bit extraction without shift**: For mux tree position bits, broadcast vectors of {1, 2, 4, 8} and AND directly instead of shifting then masking.
+- **Deferred index via parity accumulation**: The index update `idx' = 2*idx' + parity` costs 2 VALU ops per vector per round (mask + multiply_add). But for mux rounds (k=0-3), the mux only needs individual bits of idx for vselect conditions — it doesn't need the full index. So instead of maintaining the running index, and extracting the parity bits with alu/valu operations, we just store each round's parity bit (1 VALU op) and pass these directly as vselect conditions. When we finally need the actual index for a gather (at k=4), we reconstruct it from the stored parities via a multiply_add chain. This also makes it cheaper to extend mux to k=4: the 4 stored parities feed directly into 16-node vselect trees with zero VALU bit-extraction cost, which wouldn't be possible with the old approach of extracting bits from a running index.
 - **Eliminating memory round-trips**: The baseline loads indices and values from memory every round and stores them back. Instead, keep them in scratch vregs across all 16 rounds — load once at the start, store once at the end. This required rewriting the ops to chain vregs between rounds rather than going through memory. Same idea for hash constants, broadcast vectors, and mux tree node values — anything shared across rounds gets computed once and reused.
 - **Setup/teardown trimming**: Derive constants via ALU doubling (2=1+1, 4=2+2, etc.) instead of const-loads. Skip loading indices (all start at 0). Skip storing indices (submission only checks values). Load only the 2 parameters actually needed.
 
@@ -43,13 +44,13 @@ The scheduler evolved through several heuristic iterations, guided by examining 
 - **Adaptive resource bias**: Switch between load-biased and flow-biased scheduling based on how many of each are ready. If loads are running low, prioritize ops that feed loads.
 - **Remaining-predecessors momentum**: The final heuristic uses the count of unscheduled predecessors feeding each bottleneck op. As ops get scheduled, the count drops, creating momentum toward finishing groups rather than spreading work thin. It also adaptively biases toward loads vs. flows based on how many of each are currently ready: early rounds (k=0-3) use mux trees which produce vselects (flow ops) but few loads, so we bias toward feeding the scarce loads to keep them saturated. Later rounds (k=4+) are all gathers, flooding the ready queue with loads, so we shift bias toward feeding flow ops instead.
 
-The scheduler isn't optimal, but as long as VALU utilization stays close to 100%, the scheduler's choices are kind of good enough. Most improvements came from building telemetry (per-cycle slot utilization charts, per-vector readiness graphs, round completion timelines) and using it to identify specific bottleneck patterns, then tweaking heuristics to address them.
+The scheduler isn't optimal, but it is kind of parametric and tweakable. The scheduling heuristics and the mux/gather split ratios are both controlled by a handful of numeric parameters (starvation thresholds, mux_count per level, etc.) that can be grid-searched cheaply after each structural optimization. This meant I could make a code-level change (e.g., adding deferred parity, extending mux to k=4) and then quickly sweep the parameter space to find the new sweet spot. 
 
 ### 3. Mux trees vs. gathers
 
 Gathering 8 values from non-contiguous memory requires 8 load_offset ops (4 cycles at 2 loads/cycle). For small tree levels, an alternative: preload all node values at that level, broadcast each into a vector, then use a binary mux tree of vselect ops to pick the right one per element.
 
-This trades load slots (scarce, 2/cycle) for flow slots (vselect, 1/cycle) and VALU ops (broadcasts, bit extraction). For levels 0-3 (1 to 8 nodes), the trade is clearly worth it. For deeper levels, the vselect chain grows too long (and thus the number of additional valu/loads/broadcasts) and gathers win.
+This trades load slots (scarce, 2/cycle) for flow slots (vselect, 1/cycle) and VALU ops (broadcasts, bit extraction). For levels 0-3 (1 to 8 nodes), the trade is clearly worth it. For level 4 (16 nodes), each vector needs 15 vselects (flow), but the deferred parity optimization eliminates the VALU bit-extraction cost entirely. Even though individual vectors take 15 cycles for flow operations, routing some vectors through mux at k=4 creates two parallel "feeder" paths for VALU to consume, keeping VALU busier than either path alone. 
 
 The mux/gather split ratios were tuned by examining slot utilization in the telemetry charts and experimenting with different numbers. Broadcast results are cached across rounds since tree structure doesn't change.
 

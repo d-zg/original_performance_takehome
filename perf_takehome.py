@@ -812,9 +812,9 @@ def schedule(slots, slot_limits, allocator, tags=None):
             if not try_alloc_or_reuse(i, slot_defs, slot_uses, alloc_state):
                 remaining.append(i)
                 stall_alloc += 1
-                if stall_alloc <= 5:
-                    defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
-                    print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
+                # if stall_alloc <= 5:
+                #     defs_info = [(v.name_hint, v.size) for v in slot_defs[i] if isinstance(v, VReg) and v.pinned_addr is None]
+                #     print(f"  alloc_fail cycle={cycle_num} op={op_desc(i, slots)} usage={allocator.current_usage()} defs={defs_info}")
                 continue
 
             if can_native:
@@ -1801,7 +1801,7 @@ class KernelBuilder:
         # Schedule + allocate in one pass
         allocator = ScratchAllocator(self.scratch_ptr, scratch_debug=self.scratch_debug)
         bundles, sched_meta = schedule(body, slot_limits or dict(SLOT_LIMITS), allocator, tags=body_tags)
-        allocator.print_peak_info()
+        # allocator.print_peak_info()
         physical_bundles, sched_meta = expand_valu_as_alu(bundles, sched_meta)
 
         # Extract per-(vi, rnd) timing and per-op stats from sched_meta
