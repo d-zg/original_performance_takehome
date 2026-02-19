@@ -46,7 +46,8 @@ The scheduler evolved through several heuristic iterations, guided by examining 
 
 The scheduler isn't optimal, but it is kind of parametric and tweakable. The scheduling heuristics and the mux/gather split ratios are both controlled by a handful of numeric parameters (starvation thresholds, mux_count per level, etc.) that can be grid-searched cheaply after each structural optimization. This meant I could make a code-level change (e.g., adding deferred parity, extending mux to k=4) and then quickly sweep the parameter space to find the new sweet spot. 
 
-<img width="920" height="390" alt="image" src="https://github.com/user-attachments/assets/3e0488a0-d451-4d82-8920-10163dd24618" />
+<img width="904" height="354" alt="image" src="https://github.com/user-attachments/assets/6da459fe-98bf-4f48-852f-5c29aab9d2d3" />
+
 
 
 ### 3. Mux trees vs. gathers
