@@ -1,8 +1,10 @@
 # Anthropic's Original Performance Take-Home
 
-## My Approach
+## Summary of optimizations made
 
-See [APPROACH.md](APPROACH.md) for a summary of my optimization approach.
+See [APPROACH.md](APPROACH.md).
+
+---
 
 This repo contains a version of Anthropic's original performance take-home, before Claude Opus 4.5 started doing better than humans given only 2 hours.
 
